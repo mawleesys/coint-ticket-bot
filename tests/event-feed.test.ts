@@ -6,6 +6,7 @@ import { EventCursorStore } from '../src/sync/event-cursor.js';
 import {
   isCreatedEvent,
   isMessageEvent,
+  isStateEvent,
   shouldSkipMirrorEvent,
 } from '../src/sync/event-feed.js';
 import {
@@ -59,6 +60,12 @@ describe('event feed rules', () => {
     expect(
       isMessageEvent(event({ event_type: TicketEventType.Created }))
     ).toBe(false);
+    expect(isStateEvent(event({ event_type: TicketEventType.Assigned }))).toBe(
+      true
+    );
+    expect(
+      isStateEvent(event({ event_type: TicketEventType.TeamChanged }))
+    ).toBe(true);
   });
 });
 
@@ -75,7 +82,13 @@ describe('event cursor store', () => {
 
     const reloaded = new EventCursorStore(file, logger);
     expect(reloaded.get()).toBe(1842);
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ afterId: 1842 });
+    const persisted = JSON.parse(readFileSync(file, 'utf8')) as {
+      afterId: number;
+      lastSyncAt: string | null;
+    };
+    expect(persisted.afterId).toBe(1842);
+    expect(typeof persisted.lastSyncAt).toBe('string');
+    expect(reloaded.getLastSyncAt()).toBeInstanceOf(Date);
 
     rmSync(dir, { recursive: true, force: true });
   });

@@ -8,7 +8,15 @@ import {
   type UserLookupResponse,
 } from '../types/api.js';
 
-export type StaffAction = 'reply' | 'internal_note' | 'change_status' | 'close';
+export type StaffAction =
+  | 'reply'
+  | 'internal_note'
+  | 'change_status'
+  | 'close'
+  | 'assign'
+  | 'change_priority'
+  | 'change_category'
+  | 'view';
 
 export type StaffResolution =
   | { ok: true; user: UserLookupResponse }
@@ -52,8 +60,26 @@ export function messageForForbidden(code?: string): string {
       return 'Недостаточно прав для смены статуса тикета.';
     case 'forbidden_attachment':
       return 'Недостаточно прав для загрузки вложения.';
+    case 'forbidden_attachment_download':
+      return 'Недостаточно прав для скачивания вложения.';
     case 'forbidden_create':
       return 'Недостаточно прав для создания тикета.';
+    case 'forbidden_assign':
+      return 'Недостаточно прав, чтобы взять или назначить тикет (`tickets.staff.assign`).';
+    case 'forbidden_priority':
+      return 'Недостаточно прав для смены приоритета (`tickets.staff.change_priority`).';
+    case 'forbidden_category':
+      return 'Недостаточно прав для смены категории.';
+    case 'forbidden_view':
+      return 'Недостаточно прав, чтобы видеть этот тикет.';
+    case 'forbidden_stats':
+      return 'Недостаточно прав для статистики поддержки.';
+    case 'user_required':
+      return 'Для этого вложения нужен аккаунт сайта (internal/sensitive).';
+    case 'reference_not_found':
+      return 'Тикет для этого Discord-треда не найден на сайте.';
+    case 'reference_ambiguous':
+      return 'Несколько тикетов ссылаются на этот объект. Уточните тип ссылки.';
     case 'user_banned':
       return 'Аккаунт на сайте заблокирован.';
     case 'user_deleted':
@@ -61,6 +87,56 @@ export function messageForForbidden(code?: string): string {
     case 'forbidden_reply':
     default:
       return 'Недостаточно прав для ответа в тикете (нужна роль Хелпер+ / `tickets.staff.reply`).';
+  }
+}
+
+function permissionForAction(
+  user: UserLookupResponse,
+  action: StaffAction
+): boolean {
+  const perms = user.permissions;
+  if (perms.is_admin) {
+    return true;
+  }
+  switch (action) {
+    case 'reply':
+      return perms.can_reply;
+    case 'internal_note':
+      return perms.can_internal_notes;
+    case 'change_status':
+      return perms.can_change_status;
+    case 'close':
+      return perms.can_close || perms.can_change_status;
+    case 'assign':
+      return perms.can_assign;
+    case 'change_priority':
+      return perms.can_change_priority;
+    case 'change_category':
+      return perms.can_change_status;
+    case 'view':
+      return perms.can_view_tickets || perms.can_view_all_tickets;
+    default:
+      return false;
+  }
+}
+
+function forbiddenCodeForAction(action: StaffAction): string {
+  switch (action) {
+    case 'internal_note':
+      return 'forbidden_internal_note';
+    case 'change_status':
+    case 'close':
+      return 'forbidden_status';
+    case 'assign':
+      return 'forbidden_assign';
+    case 'change_priority':
+      return 'forbidden_priority';
+    case 'change_category':
+      return 'forbidden_category';
+    case 'view':
+      return 'forbidden_view';
+    default:
+      return 'forbidden_reply';
   }
 }
 
@@ -72,21 +148,8 @@ export function evaluateStaffAction(
     return { ok: false, reason: messageForForbidden('user_banned') };
   }
 
-  const allowed =
-    user.permissions.is_admin ||
-    (action === 'reply' && user.permissions.can_reply) ||
-    (action === 'internal_note' && user.permissions.can_internal_notes) ||
-    (action === 'change_status' && user.permissions.can_change_status) ||
-    (action === 'close' && (user.permissions.can_close || user.permissions.can_change_status));
-
-  if (!allowed) {
-    const code =
-      action === 'internal_note'
-        ? 'forbidden_internal_note'
-        : action === 'change_status' || action === 'close'
-          ? 'forbidden_status'
-          : 'forbidden_reply';
-    return { ok: false, reason: messageForForbidden(code) };
+  if (!permissionForAction(user, action)) {
+    return { ok: false, reason: messageForForbidden(forbiddenCodeForAction(action)) };
   }
 
   return { ok: true, user };

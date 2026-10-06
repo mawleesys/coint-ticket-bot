@@ -53,11 +53,20 @@ export type ApiErrorCode =
   | 'forbidden_internal_note'
   | 'forbidden_status'
   | 'forbidden_attachment'
+  | 'forbidden_attachment_download'
   | 'forbidden_create'
+  | 'forbidden_assign'
+  | 'forbidden_priority'
+  | 'forbidden_category'
+  | 'forbidden_view'
+  | 'forbidden_stats'
   | 'user_banned'
   | 'user_deleted'
+  | 'user_required'
   | 'external_message_conflict'
   | 'reference_conflict'
+  | 'reference_not_found'
+  | 'reference_ambiguous'
   | 'discord_link_conflict'
   | 'discord_not_linked'
   | 'invalid_discord_id';
@@ -121,6 +130,158 @@ export interface AddReferenceResponse {
   external_id: string;
 }
 
+export interface ClaimTicketRequest {
+  user_id: number;
+  source?: TicketSource;
+}
+
+export interface AssignTicketRequest {
+  user_id: number;
+  assignee_user_id?: number | null;
+  team?: string | null;
+  source?: TicketSource;
+}
+
+export interface UnassignTicketRequest {
+  user_id: number;
+  source?: TicketSource;
+}
+
+export interface SetPriorityRequest {
+  user_id: number;
+  priority: TicketPriority;
+  source?: TicketSource;
+}
+
+export interface SetCategoryRequest {
+  user_id: number;
+  category_key: string;
+  server_id?: number;
+  source?: TicketSource;
+}
+
+export type TicketListQueue =
+  | 'all'
+  | 'inbox'
+  | 'mine'
+  | 'unassigned'
+  | 'waiting-user'
+  | 'waiting-staff'
+  | 'overdue'
+  | 'resolved';
+
+export interface TicketListQuery {
+  user_id: number;
+  queue?: TicketListQueue;
+  status?: TicketStatus;
+  priority?: TicketPriority;
+  source?: TicketSource;
+  category?: string;
+  team?: string;
+  assignee_user_id?: number | 'none';
+  server_id?: number;
+  from?: string;
+  to?: string;
+  q?: string;
+  page?: number;
+  per_page?: number;
+}
+
+export interface TicketSummary {
+  id: number;
+  public_number: string;
+  status: TicketStatus;
+  priority: TicketPriority;
+  source: TicketSource;
+  subject: string;
+  category: string;
+  category_name?: string;
+  is_sensitive?: boolean;
+  team?: string | null;
+  owner_user_id?: number;
+  assignee_user_id?: number | null;
+  created_at?: string;
+  first_response_at?: string | null;
+  last_activity_at?: string;
+  sla_due_at?: string | null;
+  is_overdue?: boolean;
+  references: ExternalReference[];
+}
+
+export interface TicketListMeta {
+  page: number;
+  per_page: number;
+  total: number;
+  last_page: number;
+}
+
+export interface TicketListResponse {
+  data: TicketSummary[];
+  meta: TicketListMeta;
+}
+
+export interface ByReferenceQuery {
+  provider: string;
+  external_id: string;
+  external_type?: string;
+  user_id?: number;
+  include_internal?: boolean;
+}
+
+export interface SiteStatsQuery {
+  from?: string;
+  to?: string;
+  user_id?: number;
+}
+
+export interface SiteStatsDuration {
+  count: number;
+  avg_seconds: number;
+  median_seconds: number;
+}
+
+export interface SiteStatsSla {
+  measured: number;
+  met: number;
+  breached: number;
+  pending: number;
+  met_rate: number;
+  targets_minutes: Record<string, number>;
+}
+
+export interface SiteStatsStaff {
+  user_id: number;
+  name: string;
+  role: string;
+  replies: number;
+  tickets_replied: number;
+  replies_by_source: Record<string, number>;
+  first_responses: number;
+  first_response: SiteStatsDuration;
+  resolved: number;
+  closed: number;
+}
+
+export interface SiteStatsResponse {
+  period: { from: string; to: string };
+  tickets: {
+    created: number;
+    by_status: Record<string, number>;
+    by_priority: Record<string, number>;
+    by_source: Record<string, number>;
+    by_category: Record<string, number>;
+    without_staff_reply: number;
+  };
+  first_response: SiteStatsDuration;
+  resolution: SiteStatsDuration;
+  sla: SiteStatsSla;
+  by_channel: {
+    replies: Record<string, number>;
+    first_responses: Record<string, number>;
+  };
+  by_staff: SiteStatsStaff[];
+}
+
 export interface TicketAttachment {
   id: number;
   message_id: number | null;
@@ -168,6 +329,8 @@ export interface Ticket {
   resolved_at?: string | null;
   closed_at?: string | null;
   last_activity_at?: string;
+  sla_due_at?: string | null;
+  is_overdue?: boolean;
   messages: TicketMessage[];
   attachments?: TicketAttachment[];
   references: ExternalReference[];

@@ -4,12 +4,17 @@
 
 import type { Logger } from 'pino';
 import type { Config } from '../config/index.js';
+import type { SiteApiClient } from '../api/site-client.js';
 import type {
   TicketMetrics,
   AggregatedStats,
   StaffStats,
 } from '../types/discord.js';
-import { TicketPriority } from '../types/api.js';
+import {
+  TicketPriority,
+  type SiteStatsResponse,
+} from '../types/api.js';
+import { daysAgo, toDateOnly } from '../sync/resync.js';
 
 /**
  * Скелет модуля статистики
@@ -19,7 +24,7 @@ export class StatsCollector {
   private metrics: Map<string, TicketMetrics> = new Map();
 
   constructor(
-    _config: Config,
+    private readonly config: Config,
     private readonly logger: Logger
   ) {}
 
@@ -305,6 +310,77 @@ export class StatsCollector {
   /**
    * Форматирует статистику для Discord embed
    */
+  formatSiteStatsForDiscord(stats: SiteStatsResponse): string {
+    const firstAvgMin = Math.round(stats.first_response.avg_seconds / 60);
+    const firstMedMin = Math.round(stats.first_response.median_seconds / 60);
+    const resAvgMin = Math.round(stats.resolution.avg_seconds / 60);
+    const resMedMin = Math.round(stats.resolution.median_seconds / 60);
+    const metRate = (stats.sla.met_rate * 100).toFixed(1);
+    const resolved = stats.tickets.by_status.resolved ?? 0;
+    const closed = stats.tickets.by_status.closed ?? 0;
+
+    const staffLines = stats.by_staff.slice(0, 8).map((member) => {
+      return `• ${member.name} (${member.role}): ${member.replies} ответов, ${member.resolved} решено`;
+    });
+
+    const lines: string[] = [
+      `📊 **Статистика поддержки (сайт)**`,
+      `${stats.period.from} – ${stats.period.to}`,
+      '',
+      `**Тикеты:**`,
+      `• Создано: ${stats.tickets.created}`,
+      `• Решено: ${resolved}`,
+      `• Закрыто: ${closed}`,
+      `• Без ответа персонала: ${stats.tickets.without_staff_reply}`,
+      '',
+      `**Первый ответ:**`,
+      `• Среднее: ${firstAvgMin} мин`,
+      `• Медиана: ${firstMedMin} мин`,
+      '',
+      `**Решение:**`,
+      `• Среднее: ${resAvgMin} мин`,
+      `• Медиана: ${resMedMin} мин`,
+      '',
+      `**SLA:** ${metRate}% (${stats.sla.met}/${stats.sla.measured}, просрочено ${stats.sla.breached}, в ожидании ${stats.sla.pending})`,
+    ];
+
+    if (staffLines.length > 0) {
+      lines.push('', '**Персонал:**', ...staffLines);
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Недельный отчёт: сначала GET /stats, иначе локальный расчёт.
+   */
+  async getWeeklySummary(
+    siteApi: SiteApiClient,
+    userId?: number,
+    now: Date = new Date()
+  ): Promise<{ text: string; source: 'site' | 'local' }> {
+    const from = daysAgo(7, now);
+    const to = now;
+
+    if (this.config.features.siteStats) {
+      try {
+        const site = await siteApi.getStats({
+          from: toDateOnly(from),
+          to: toDateOnly(to),
+          user_id: userId,
+        });
+        return { text: this.formatSiteStatsForDiscord(site), source: 'site' };
+      } catch (error) {
+        this.logger.warn({ error }, 'GET /stats failed, falling back to local metrics');
+      }
+    }
+
+    return {
+      text: this.formatStatsForDiscord(this.calculateStats(from, to)),
+      source: 'local',
+    };
+  }
+
   formatStatsForDiscord(stats: AggregatedStats): string {
     const lines: string[] = [
       `📊 **Статистика за период**`,

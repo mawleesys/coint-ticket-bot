@@ -11,6 +11,9 @@ const STATE_EVENTS = new Set<string>([
   'reopened',
   'priority_changed',
   'category_changed',
+  'assigned',
+  'unassigned',
+  'team_changed',
 ]);
 
 /**

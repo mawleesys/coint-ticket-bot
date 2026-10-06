@@ -3,9 +3,10 @@
  */
 
 import { StatsCollector } from '../src/stats/collector.js';
-import { TicketPriority } from '../src/types/api.js';
+import { TicketPriority, type SiteStatsResponse } from '../src/types/api.js';
 import { createTestConfig } from '../src/config/index.js';
 import type { TicketMetrics } from '../src/types/discord.js';
+import { SiteApiClient } from '../src/api/site-client.js';
 import pino from 'pino';
 
 const mockConfig = createTestConfig();
@@ -240,6 +241,92 @@ describe('StatsCollector', () => {
       expect(formatted).toContain('Статистика за период');
       expect(formatted).toContain('Всего тикетов');
       expect(formatted).toContain('SLA соответствие');
+    });
+  });
+
+  describe('site stats formatting and fallback', () => {
+    const siteStats: SiteStatsResponse = {
+      period: { from: '2026-09-29', to: '2026-10-06' },
+      tickets: {
+        created: 12,
+        by_status: { resolved: 8, closed: 2 },
+        by_priority: { normal: 10 },
+        by_source: { website: 12 },
+        by_category: { technical: 12 },
+        without_staff_reply: 1,
+      },
+      first_response: { count: 10, avg_seconds: 3600, median_seconds: 1800 },
+      resolution: { count: 8, avg_seconds: 7200, median_seconds: 3600 },
+      sla: {
+        measured: 10,
+        met: 9,
+        breached: 1,
+        pending: 0,
+        met_rate: 0.9,
+        targets_minutes: { low: 2880, normal: 1440, high: 240, urgent: 60 },
+      },
+      by_channel: { replies: { discord: 4 }, first_responses: { discord: 2 } },
+      by_staff: [
+        {
+          user_id: 45,
+          name: 'Helper',
+          role: 'Хелпер',
+          replies: 5,
+          tickets_replied: 3,
+          replies_by_source: { discord: 5 },
+          first_responses: 2,
+          first_response: { count: 2, avg_seconds: 600, median_seconds: 600 },
+          resolved: 2,
+          closed: 0,
+        },
+      ],
+    };
+
+    it('formats GET /stats payload for Discord', () => {
+      const text = collector.formatSiteStatsForDiscord(siteStats);
+      expect(text).toContain('Статистика поддержки (сайт)');
+      expect(text).toContain('Создано: 12');
+      expect(text).toContain('90.0%');
+      expect(text).toContain('Helper');
+    });
+
+    it('uses GET /stats when available', async () => {
+      const siteApi = {
+        getStats: async () => siteStats,
+      } as unknown as SiteApiClient;
+
+      const summary = await collector.getWeeklySummary(
+        siteApi,
+        45,
+        new Date('2026-10-06T12:00:00Z')
+      );
+      expect(summary.source).toBe('site');
+      expect(summary.text).toContain('Создано: 12');
+    });
+
+    it('falls back to local calc if GET /stats fails', async () => {
+      collector.recordTicketMetrics({
+        ticketNumber: 'COINT-LOCAL',
+        category: 'technical',
+        priority: TicketPriority.Normal,
+        createdAt: new Date('2026-10-05T10:00:00Z'),
+        staffRepliesCount: 1,
+        userRepliesCount: 0,
+      });
+
+      const siteApi = {
+        getStats: async () => {
+          throw new Error('stats down');
+        },
+      } as unknown as SiteApiClient;
+
+      const summary = await collector.getWeeklySummary(
+        siteApi,
+        45,
+        new Date('2026-10-06T12:00:00Z')
+      );
+      expect(summary.source).toBe('local');
+      expect(summary.text).toContain('Всего тикетов');
     });
   });
 

@@ -104,10 +104,10 @@ graph TB
 
 #### Discord → Сайт (запись)
 
-1. **Сообщение в треде:** бот резолвит Discord user → site user (через API, когда будет реализовано), отправляет `POST /{ticket}/messages`
+1. **Сообщение в треде:** бот резолвит Discord user → site user (`GET /users/by-discord/{id}`), затем `POST /{ticket}/messages`
 2. **Префикс `!note`:** становится внутренней заметкой (`is_internal=true`)
-3. **Кнопки:** изменяют статус через `POST /{ticket}/status`
-4. **Вложения:** скачиваются и загружаются через `POST /{ticket}/attachments`
+3. **Кнопки:** «Взять» → `POST /{ticket}/claim`; приоритет → `/priority`; «Решить»/«Закрыть» → `/status`. Тикет ищется в памяти, иначе `GET /by-reference`
+4. **Вложения:** предпочтительно `GET /{ticket}/attachments/{id}` (`user_id` для internal/sensitive)
 5. **Dedupe:** `external_message_id` (Discord message ID) предотвращает дубли
 
 ---
@@ -131,22 +131,23 @@ graph TB
 
 ### Этап 1: Зеркалирование (read-only)
 
-- ✅ Сайт: outbox `GET /events` (skip `source=discord`)
-- ✅ Бот поллит ленту и держит курсор на диске
+- ✅ Сайт: outbox `GET /events` (skip `source=discord`), retention 90 дней
+- ✅ Бот поллит ленту, курсор на диске; stale cursor → resync через `GET /` + `GET /{ticket}`
 - ⏳ Включить API в prod и выключить старый webhook
-- ⏳ Пересылка вложений с сайта
+- ⏳ Пересылка вложений Discord → сайт
 
 ### Этап 2: Двусторонняя синхронизация
 
 - ✅ `GET /users/by-discord/{id}` — без заглушки `user_id=1`
 - ✅ Discord → сайт: ответы и `!note`, replay 200 / 409
-- ⏳ Кнопки «взять» и приоритет (на сайте нет assign/priority API)
+- ✅ Кнопки «взять» / приоритет / решить / закрыть (claim, priority, status)
+- ✅ `GET /by-reference` для резолва тикета из треда
 - ⏳ Загрузка вложений Discord → сайт
 
 ### Этап 3: Статистика и отчёты
 
-- ⏳ Сбор реальных метрик из сайта
-- ⏳ Еженедельные отчёты в Discord
+- ✅ `GET /stats` для недельного отчёта (локальный расчёт — fallback)
+- ⏳ Публикация в канал, когда задан `DISCORD_STATS_CHANNEL_ID` и API включён
 - ⏳ Дашборд команды (опционально)
 
 ### Этап 4: Расширенные функции
@@ -176,11 +177,13 @@ coint-ticket-bot/
 │   │   └── demo.ts                # Офлайн-демонстрация без токенов
 │   ├── sync/
 │   │   ├── dedupe-guard.ts        # Защита от дублей
-│   │   ├── event-cursor.ts        # Персистентный after_id
+│   │   ├── event-cursor.ts        # after_id + lastSyncAt
 │   │   ├── event-feed.ts          # Правила outbox → Discord
 │   │   ├── loop-guard.ts          # Игнор bot/webhook и source=discord
 │   │   ├── mapping-store.ts       # Хранилище тикет ↔ тред
+│   │   ├── resync.ts              # Stale cursor → list + GET /{ticket}
 │   │   ├── staff-resolver.ts      # Discord → site user + права
+│   │   ├── ticket-actions.ts      # Кнопки карточки → API
 │   │   └── sync-engine.ts         # Движок синхронизации
 │   ├── stats/
 │   │   └── collector.ts           # Сбор статистики
@@ -334,7 +337,7 @@ curl -H "Authorization: Bearer your_secure_random_token_here" \
 
 1. Выставить `SUPPORT_INTERNAL_API` / `SUPPORT_INTERNAL_TOKEN`.
 2. После стабильного зеркала — выключить старый `support.webhook`.
-3. (Позже) assign/priority API, list/search, scoped download вложений, cleanup outbox.
+3. Создать Discord-приложение (intents, форумы, токен) и пригласить бота на сервер.
 
 #### 4. Отключение старого webhook
 
@@ -409,6 +412,7 @@ npm run dev
 |---|---|---|
 | `SITE_URL` | ✅ | Базовый URL сайта (без слеша на конце) |
 | `SITE_API_TOKEN` | ✅ | Токен для Internal API (из `SUPPORT_INTERNAL_TOKEN`) |
+| `SITE_ACTOR_USER_ID` | | Site user для list / stats / resync (`tickets.staff.view`) |
 | `SITE_API_TIMEOUT` | | Таймаут запросов (мс) | `10000` |
 
 ### Синхронизация
@@ -418,7 +422,8 @@ npm run dev
 | `SYNC_POLL_INTERVAL` | `30` | Интервал опроса `GET /events` (секунды) |
 | `SYNC_BATCH_SIZE` | `50` | Legacy batch (не лента) |
 | `SYNC_EVENTS_LIMIT` | `100` | Событий за запрос (макс. 500) |
-| `SYNC_CURSOR_PATH` | `./data/event-cursor.json` | Файл курсора `after_id` |
+| `SYNC_CURSOR_PATH` | `./data/event-cursor.json` | Файл курсора `after_id` + `lastSyncAt` |
+| `OUTBOX_RETENTION_DAYS` | `90` | Если курсор старше — resync через `GET /` |
 
 ### Статистика
 
@@ -439,6 +444,9 @@ npm run dev
 | `FEATURE_SITE_PERMISSION_CHECK` | `true` | Ожидать 403 `forbidden_*` с сайта |
 | `FEATURE_MESSAGE_DEDUPE_BY_EXTERNAL_ID` | `true` | Идемпотентность по Discord message id |
 | `FEATURE_CATEGORIES_ENDPOINT` | `true` | `GET /categories` |
+| `FEATURE_TICKET_MANAGEMENT` | `true` | claim / assign / priority / category |
+| `FEATURE_TICKET_LIST` | `true` | `GET /` для resync |
+| `FEATURE_SITE_STATS` | `true` | `GET /stats` для недельного отчёта |
 
 Подробный список доработок сайта: [`docs/site-gaps.md`](docs/site-gaps.md). Спецификация API: [`docs/site-internal-api.md`](docs/site-internal-api.md).
 
@@ -660,20 +668,22 @@ npm run type-check
 ### Этап 1: Зеркалирование (read-only)
 
 - [x] Outbox `GET /events` на сайте и поллинг в боте
+- [x] Resync через list, если курсор старше retention (90 дней)
 - [ ] Включить Internal API в prod
 - [ ] Отключить старый webhook после стабильного зеркала
+- [ ] Создать Discord-приложение и пригласить бота
 
 ### Этап 2: Двусторонняя синхронизация
 
 - [x] Lookup Discord и проверки прав на сайте
 - [x] Ответы / `!note` из Discord без `user_id=1`
-- [ ] Кнопки assign/priority (нужны endpoint’ы сайта)
-- [ ] Вложения в обе стороны
+- [x] Кнопки claim / priority / resolve / close
+- [ ] Вложения Discord → сайт
 
 ### Этап 3: Статистика
 
-- [ ] Реальный сбор метрик из site API
-- [ ] Еженедельные отчёты
+- [x] `GET /stats` + fallback на локальный расчёт
+- [x] Еженедельный отчёт (канал, если задан `DISCORD_STATS_CHANNEL_ID`)
 - [ ] Команда `/stats` для персонала
 
 ### Этап 4: Расширенные функции
@@ -778,14 +788,14 @@ export class PersistentMappingStore {
 
 ### Site API
 
-Актуально: [`docs/site-gaps.md`](docs/site-gaps.md). Outbox, lookup, права и dedupe уже на сайте. Открыто: API выключен в prod, нет assign/priority/list, вложения не scoped, нет cleanup outbox, старый webhook ещё жив.
+Актуально: [`docs/site-gaps.md`](docs/site-gaps.md). Claim/assign/priority/list/by-reference/stats/scoped attachments и retention outbox уже на сайте. Открыто: API выключен в prod, старый webhook ещё жив, Discord-приложение бота ещё не создано.
 
 ### Текущие ограничения бота
 
-- Маппинг тикет ↔ тред в памяти (ссылка пишется на сайт через `/references`)
-- Курсор ленты персистентен (`SYNC_CURSOR_PATH`)
+- Маппинг тикет ↔ тред в памяти (ссылка на сайте через `/references` и `GET /by-reference`)
+- Курсор ленты персистентен (`afterId` + `lastSyncAt`); при stale — resync
 - Нет `/ticket` из Discord и автоархивации
-- Статистика в памяти
+- Статистика с сайта (`GET /stats`); локальный расчёт — fallback
 
 ---
 

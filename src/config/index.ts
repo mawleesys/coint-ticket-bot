@@ -45,6 +45,8 @@ const configSchema = z
       url: z.string().default(''),
       apiToken: z.string().default(''),
       apiTimeout: z.coerce.number().int().min(1000).default(10000),
+      /** Site user for list / stats / resync (staff with view). */
+      actorUserId: z.number().int().positive().optional(),
     }),
 
     sync: z.object({
@@ -52,6 +54,7 @@ const configSchema = z
       batchSize: z.coerce.number().int().min(1).max(100).default(50),
       eventsLimit: z.coerce.number().int().min(1).max(500).default(100),
       cursorPath: z.string().default('./data/event-cursor.json'),
+      outboxRetentionDays: z.coerce.number().int().min(1).default(90),
     }),
 
     stats: z.object({
@@ -70,6 +73,9 @@ const configSchema = z
       sitePermissionCheck: z.boolean().default(true),
       messageDedupeByExternalId: z.boolean().default(true),
       categoriesEndpoint: z.boolean().default(true),
+      ticketManagement: z.boolean().default(true),
+      ticketList: z.boolean().default(true),
+      siteStats: z.boolean().default(true),
     }),
 
     maxAttachmentSize: z.coerce.number().int().min(1).default(8388608),
@@ -139,6 +145,9 @@ export function readEnvConfig(): Record<string, unknown> {
       url: process.env.SITE_URL || '',
       apiToken: process.env.SITE_API_TOKEN || '',
       apiTimeout: parseInt(process.env.SITE_API_TIMEOUT || '10000', 10),
+      actorUserId: process.env.SITE_ACTOR_USER_ID
+        ? parseInt(process.env.SITE_ACTOR_USER_ID, 10)
+        : undefined,
     },
 
     sync: {
@@ -146,6 +155,10 @@ export function readEnvConfig(): Record<string, unknown> {
       batchSize: parseInt(process.env.SYNC_BATCH_SIZE || '50', 10),
       eventsLimit: parseInt(process.env.SYNC_EVENTS_LIMIT || '100', 10),
       cursorPath: process.env.SYNC_CURSOR_PATH || './data/event-cursor.json',
+      outboxRetentionDays: parseInt(
+        process.env.OUTBOX_RETENTION_DAYS || '90',
+        10
+      ),
     },
 
     stats: {
@@ -161,6 +174,9 @@ export function readEnvConfig(): Record<string, unknown> {
       messageDedupeByExternalId:
         process.env.FEATURE_MESSAGE_DEDUPE_BY_EXTERNAL_ID !== 'false',
       categoriesEndpoint: process.env.FEATURE_CATEGORIES_ENDPOINT !== 'false',
+      ticketManagement: process.env.FEATURE_TICKET_MANAGEMENT !== 'false',
+      ticketList: process.env.FEATURE_TICKET_LIST !== 'false',
+      siteStats: process.env.FEATURE_SITE_STATS !== 'false',
     },
 
     maxAttachmentSize: parseInt(process.env.MAX_ATTACHMENT_SIZE || '8388608', 10),
@@ -242,12 +258,14 @@ export function createTestConfig(overrides: Partial<Config> = {}): Config {
       url: 'http://127.0.0.1:9',
       apiToken: 'test-token',
       apiTimeout: 5000,
+      actorUserId: 45,
     },
     sync: {
       pollInterval: 30,
       batchSize: 50,
       eventsLimit: 100,
       cursorPath: './data/event-cursor.json',
+      outboxRetentionDays: 90,
     },
     stats: {
       enabled: true,
@@ -260,6 +278,9 @@ export function createTestConfig(overrides: Partial<Config> = {}): Config {
       sitePermissionCheck: true,
       messageDedupeByExternalId: true,
       categoriesEndpoint: true,
+      ticketManagement: true,
+      ticketList: true,
+      siteStats: true,
     },
     maxAttachmentSize: 8388608,
     debugApiRequests: false,

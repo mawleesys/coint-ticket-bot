@@ -2,7 +2,9 @@
 
 > Source of truth: Azuriom site, plugin `plugins/support` (Azuriom "Support" 1.1.9, heavily extended in-house).
 > Produced by reading the deployed code. **Updated 2026-10-06:** event feed, categories, Discord user lookup, permission
-> checks, message dedupe and webhook `source` were added on the site. The API is still **disabled** (env not set).
+> checks, message dedupe and webhook `source` were added on the site; later the same day (round 2) list/search,
+> find-by-reference, stats, claim/assign/unassign, priority, category, ticket-scoped attachment download and feed
+> retention. The API is still **disabled** (env not set).
 > No secrets / hosts / personal data are included. `{SITE_URL}` = the site's public base URL (placeholder).
 
 ---
@@ -35,6 +37,7 @@ Config constants (`config/support.php`):
 'reply_per_minute'         => 10,
 'attachment_max_kilobytes' => 8192,   // 8 MB
 'attachment_max_files'     => 5,      // per create/reply via website (API uploads one file per call)
+'outbox_retention_days'    => 90,     // env SUPPORT_OUTBOX_RETENTION_DAYS (optional); feed rows older than this are purged daily
 ```
 
 Site settings that affect the API (DB `settings` table, managed in admin):
@@ -64,6 +67,21 @@ Common write-endpoint rules (since 2026-10-06):
 - The acting user must not be deleted/banned → **403** `{"code":"user_deleted"|"user_banned"}`.
 - Permissions are checked with the site `TicketPolicy` → **403** `{"message": "...", "code": "forbidden_*"}`.
 - The request `source` (`website`/`discord`/`system`) is recorded on the change and in the event feed (§2.9).
+- Management endpoints (§2.12–2.15) go through the same services as the admin panel: ticket history
+  (`support_ticket_events`), Discord webhook (§6) and feed event are produced exactly as for a website action.
+
+Route overview:
+
+| Method | Path | § |
+|---|---|---|
+| GET | `/` (list/search) | 2.16 |
+| POST | `/` | 2.1 |
+| GET | `/events` · `/categories` · `/by-reference` · `/stats` | 2.9 · 2.10 · 2.17 · 2.18 |
+| GET | `/{ticket}` | 2.2 |
+| GET | `/{ticket}/attachments/{attachment}` (preferred) · `/attachments/{attachment}` (deprecated) | 2.5 |
+| POST | `/{ticket}/messages` · `/attachments` · `/status` · `/references` | 2.3 · 2.4 · 2.6 · 2.7 |
+| POST | `/{ticket}/claim` · `/assign` · `/unassign` · `/priority` · `/category` | 2.12 – 2.15 |
+| GET | `{SITE_URL}/api/internal/users/by-discord/{id}` | 2.11 |
 
 ### 2.1 `POST /` — create ticket
 Body (JSON):
@@ -132,8 +150,18 @@ Allowed types (extension **and** detected MIME): png, jpg/jpeg, webp, txt, log (
 Feed event `attachment_added` (`payload.attachment_id`, `payload.name`). No webhook.
 Response **201**: `{ "id": 55 }`
 
-### 2.5 `GET /attachments/{attachment}` — download attachment
-Numeric id; streams the file. 404 if missing. Still **not** ticket-scoped and not filtered by internal/sensitive — the bot must enforce visibility (use `attachments[]` from §2.8, which already hides internal ones unless `include_internal=1`).
+### 2.5 `GET /{ticket}/attachments/{attachment}` — download attachment (ticket-scoped)
+Query: `user_id` (optional, integer, exists). Streams the file.
+- Attachment belongs to another ticket → **404** (same as unknown id / missing file).
+- With `user_id`: needs the site download right (owner of a public attachment, or staff who can see the ticket;
+  sensitive ticket → `view_sensitive`) and, for attachments of internal notes, the internal-notes right → else
+  **403** `forbidden_attachment_download`. Deleted/banned → 403 `user_deleted`/`user_banned`.
+- Without `user_id`: public attachments of non-sensitive tickets only; an internal-note attachment or any attachment
+  of a sensitive ticket → **403** `user_required`.
+
+**Deprecated:** `GET /attachments/{attachment}` (numeric id, not ticket-scoped) still works for compatibility and
+applies the same `user_id` / `user_required` rules (behaviour change vs. before: internal/sensitive attachments now
+require `user_id`). Migrate to the ticket-scoped path.
 
 ### 2.6 `POST /{ticket}/status` — change status
 Body: `status` (required, §3.1), `user_id` (integer, exists — **required unless `source=system`**, else 422 `user_id`), `source` (optional, default `discord`).
@@ -150,7 +178,7 @@ Unique key `(provider, external_type, external_id)`:
 
 Response: `{ "id": 7, "provider": "discord", "external_type": "thread", "external_id": "123456789012345678" }`
 
-### 2.8 Ticket payload (create / show / status)
+### 2.8 Ticket payload (create / show / status / management / by-reference)
 ```json
 {
   "id": 207,
@@ -173,6 +201,8 @@ Response: `{ "id": 7, "provider": "discord", "external_type": "thread", "externa
   "resolved_at": null,
   "closed_at": null,
   "last_activity_at": "2026-10-06T10:05:00+05:00",
+  "sla_due_at": "2026-10-07T10:00:00+05:00",
+  "is_overdue": false,
   "messages": [
     {
       "id": 901,
@@ -193,7 +223,10 @@ Response: `{ "id": 7, "provider": "discord", "external_type": "thread", "externa
   ]
 }
 ```
-All original keys are unchanged; the rest were added (additive, backwards compatible). Timestamps are ISO-8601 with the
+All original keys are unchanged; the rest were added (additive, backwards compatible).
+`sla_due_at` = `created_at` + first-response target of the **current** priority (not stored, so a priority change moves it);
+`is_overdue` = the site's own overdue rule (`Ticket::isOverdue()`, the same one the admin panel uses for its overdue badge/queue), e.g. an already answered ticket is not overdue even if `sla_due_at` is past.
+Timestamps are ISO-8601 with the
 server offset. Internal messages/attachments only with `include_internal=1` (show). Bodies of sensitive tickets **are**
 returned — route them by `is_sensitive` to the restricted channel only.
 
@@ -230,7 +263,10 @@ Query: `after_id` (int ≥ 0, default 0), `limit` (1–500, default 100). Ordere
 - `is_sensitive=true`: `payload` is reduced to non-textual keys (ids, statuses); e.g. attachment file names are removed.
 - `payload` per type = §3.5; `message_created` → `{author_type, is_internal}`.
 - Rows are written in the same DB transaction as the change (no lost/phantom events). The feed starts empty
-  (deployed 2026-10-06); there is no backfill of older history. No retention/pruning yet.
+  (deployed 2026-10-06); there is no backfill of older history.
+- **Retention:** rows older than `support.outbox_retention_days` (default 90) are deleted daily at 03:30 by the
+  scheduled command `support:purge-outbox` (manual: `php artisan support:purge-outbox [--days=N]`). A bot that is
+  offline longer than the retention window must resync from §2.16/§2.2 instead of the feed.
 - Poll with `after_id = last processed id`; persist the cursor on the bot side.
 
 ### 2.10 `GET /categories`
@@ -278,6 +314,96 @@ Response **200**:
 ```
 Flags are computed with the same `TicketAccess` rules as the site (admin roles → all true). They are global flags;
 per-ticket visibility (sensitive / assigned to someone else) is still enforced by the write endpoints.
+
+
+### 2.12 `POST /{ticket}/claim` — take the ticket
+Body: `user_id` (required), `source` (optional, default `discord`).
+Permission `tickets.staff.assign` + ticket visibility → else **403** `forbidden_assign`. Already assigned to that user → no-op.
+History `assigned`, webhook `assigned`, feed `assigned`. Response **200** — ticket payload (§2.8).
+
+### 2.13 `POST /{ticket}/assign` — set assignee and/or team
+Body: `user_id` (required, actor), `assignee_user_id` (integer or `null` = unassign), `team` (team key or `null` = no team),
+`source` (optional). At least one of `assignee_user_id` / `team` must be **present** → else 422.
+- Actor needs `tickets.staff.assign` + ticket visibility → else **403** `forbidden_assign`.
+- Assignee must be active (not deleted/banned), have `tickets.staff.view`, and `view_sensitive` for a sensitive
+  ticket → else **422** (`assignee_user_id`). Unknown team key → **422** (`team`).
+- Unchanged values are skipped (no event). Feed: `assigned` / `unassigned` / `team_changed`.
+
+`POST /{ticket}/unassign` — body `user_id`, `source?`; same permission; removes the assignee (feed `unassigned`).
+Response **200** — ticket payload.
+
+### 2.14 `POST /{ticket}/priority`
+Body: `user_id`, `priority` (§3.2), `source?`. Permission `tickets.staff.change_priority` + visibility → else
+**403** `forbidden_priority`. Same priority → no-op. SLA is recomputed implicitly (see `sla_due_at`, §2.8).
+History/webhook/feed `priority_changed`. Response **200** — ticket payload.
+
+### 2.15 `POST /{ticket}/category`
+Body: `user_id`, `category_key` (must exist → else 422), `server_id` (optional), `source?`.
+Permission: `tickets.staff.change_status` + visibility (same as the admin panel), and moving **into** a sensitive
+category requires `view_sensitive` → else **403** `forbidden_category`. The team follows the admin logic of
+`TicketService::changeCategory`. History/webhook/feed `category_changed`. Response **200** — ticket payload.
+
+### 2.16 `GET /` — list / search tickets
+Query:
+
+| Param | Notes |
+|---|---|
+| `user_id` | **required** — the requesting site account; results are limited to what it may see |
+| `queue` | `all` (default) · `inbox` (open) · `mine` (open, assigned to `user_id`) · `unassigned` (open) · `waiting-user` · `waiting-staff` · `overdue` · `resolved` (resolved + closed) — same as the admin queues |
+| `status`, `priority`, `source` | enum filters |
+| `category`, `team` | keys; an unknown key returns an empty page |
+| `assignee_user_id` | integer or `none` |
+| `server_id`, `from`, `to` | `from`/`to` = creation date (inclusive, `YYYY-MM-DD`) |
+| `q` | number or subject substring (`COI-…` is normalized to `COINT-…`), max 100 chars |
+| `page`, `per_page` | default 1 / 30, `per_page` 1–100 |
+
+Visibility: staff (`staff.view`/`view_all`) → the staff visibility rule (sensitive only with `view_sensitive`;
+`view` without `view_all` → unassigned + own); otherwise `tickets.view_own` → own tickets only; neither → **403**
+`forbidden_view`. Deleted/banned → 403. Sorted by `last_activity_at` desc.
+```json
+{ "data": [ { "id": 207, "public_number": "COINT-1207", "status": "open", "priority": "normal", "source": "discord",
+              "subject": "…", "category": "technical", "category_name": "…", "is_sensitive": false, "team": "technical",
+              "owner_user_id": 123, "assignee_user_id": null, "created_at": "…", "first_response_at": null,
+              "last_activity_at": "…", "sla_due_at": "…", "is_overdue": false,
+              "references": [ { "provider": "discord", "external_type": "thread", "external_id": "…" } ] } ],
+  "meta": { "page": 1, "per_page": 30, "total": 1, "last_page": 1 } }
+```
+List items are a summary (no messages/attachments); fetch details via §2.2.
+
+### 2.17 `GET /by-reference` — find a ticket by external object
+Query: `provider` (required), `external_type` (optional), `external_id` (required), `user_id` (optional),
+`include_internal` (optional bool). Example: `provider=discord&external_type=thread&external_id=<thread id>`.
+- not found → **404** `reference_not_found`;
+- several tickets (only possible without `external_type`) → **409** `reference_ambiguous` with `ticket_numbers`;
+- with `user_id`: must be allowed to view the ticket (and to see internal notes if `include_internal=1`) → else **403** `forbidden_view`.
+Response **200** — full ticket payload (§2.8).
+
+### 2.18 `GET /stats` — support statistics
+Query: `from`, `to` (dates, inclusive; default = last 30 days up to now; `from > to` or > 366 days → 422),
+`user_id` (optional; if given it needs `tickets.staff.view` → else **403** `forbidden_stats`).
+Scope: tickets **created** in the period (merged tickets excluded); staff activity = public staff messages and
+resolve/close events in the period. No player names, subjects or message text are returned (staff names/roles are).
+```json
+{
+  "period": { "from": "…", "to": "…" },
+  "tickets": { "created": 120, "by_status": {"open": 10}, "by_priority": {"normal": 100}, "by_source": {"website": 90, "discord": 30},
+               "by_category": {"technical": 40}, "without_staff_reply": 5 },
+  "first_response": { "count": 110, "avg_seconds": 5400, "median_seconds": 1800 },
+  "resolution":     { "count": 95,  "avg_seconds": 86400, "median_seconds": 43200 },
+  "sla": { "measured": 110, "met": 100, "breached": 10, "pending": 3, "met_rate": 0.9091,
+           "targets_minutes": { "low": 2880, "normal": 1440, "high": 240, "urgent": 60 } },
+  "by_channel": { "replies": {"website": 300, "discord": 80}, "first_responses": {"website": 90, "discord": 20} },
+  "by_staff": [ { "user_id": 45, "name": "…", "role": "Модератор", "replies": 50, "tickets_replied": 30,
+                  "replies_by_source": {"website": 40, "discord": 10}, "first_responses": 20,
+                  "first_response": { "count": 20, "avg_seconds": 3600, "median_seconds": 1500 },
+                  "resolved": 15, "closed": 3 } ]
+}
+```
+- First response = `first_response_at`, or (tickets before 2026-09-23 without it) the first public staff message.
+- SLA: `met` = first response within the target of the ticket's priority; `breached` = late or still unanswered past
+  the target; `pending` = unanswered and still within the target (not part of `measured`).
+- Resolution = `resolved_at` (or `closed_at`) − `created_at` for resolved/closed tickets.
+- Channel = message `source` (`website` / `discord` / `system`). Empty maps are `{}`.
 
 ---
 
@@ -383,7 +509,8 @@ Current catalog (keys are stable identifiers):
 
 ### 4.7b `support_ticket_outbox` (event feed, since 2026-10-06)
 `id` (bigint, cursor), `ticket_id` (FK, cascade), `event_type` (≤64), `source` (≤32), `actor_user_id` (FK users, nullable),
-`message_id` (nullable, no FK), `payload` (json, no message text), `created_at`. Index `(ticket_id, id)`.
+`message_id` (nullable, no FK), `payload` (json, no message text), `created_at`. Indexes `(ticket_id, id)` and
+`created_at` (for the daily retention purge, `support:purge-outbox`).
 
 ### 4.8 Discord account link (Azuriom core): `discord_accounts`
 `id`, `name` (Discord username), `user_id` (FK users, cascade), `discord_user_id` (string snowflake, **no unique index**),
@@ -412,6 +539,7 @@ Permission keys (checked by `TicketPolicy` / `TicketAccess` on the website **and
 | legacy `support.tickets` / `support.categories` | imply the staff set / manage_categories |
 
 Rules:
+- Applied by the internal API to every write endpoint, the list/search, by-reference (when `user_id` given), stats and attachment download.
 - `staffCanSee`: sensitive category requires `view_sensitive`; then `view_all` → yes; `view` → only if unassigned or assigned to self.
 - reply (staff) = `staffCanSee` && `tickets.staff.reply`; internal note = `staffCanSee` && `tickets.staff.internal_notes`; etc.
 - Owner may close own ticket (`reply_own`). Owner never sees internal notes or attachments on internal messages.
@@ -489,16 +617,20 @@ Done on the site (code + migrations deployed, covered by tests):
 - ✅ #3 dedupe: unique `(source, external_message_id)`, written in the insert transaction, idempotent 200 replay without webhook/notifications, 409 on cross-ticket reuse.
 - ✅ #4/#5 event feed `GET /events` with `source`, `is_sensitive`, no text; webhook embeds carry `source` in the footer.
 - ✅ #6 `GET /api/internal/users/by-discord/{id}` (404 / 409 / 200 with permission flags).
-- ✅ #7 categories endpoint and enriched ticket payload (ids, owner, assignee, team, timestamps, message author/time, attachments, `is_sensitive`).
+- ✅ #7 categories endpoint and enriched ticket payload (ids, owner, assignee, team, timestamps, message author/time, attachments, `is_sensitive`, `sla_due_at`, `is_overdue`).
 - ✅ #10 reference conflicts → 409 unless `move: true`.
 - ✅ #11 resolve/close via API send player notifications.
+- ✅ claim / assign / unassign / team, priority, category endpoints (§2.12–2.15) with admin-equivalent history/webhook/feed.
+- ✅ list/search with admin queues and filters, pagination, permission-aware visibility (§2.16); find by reference (§2.17).
+- ✅ ticket-scoped attachment download with internal/sensitive checks (§2.5); old path deprecated but compatible.
+- ✅ feed retention: daily `support:purge-outbox` (90 days, configurable) + `created_at` index.
+- ✅ stats endpoint (§2.18): counts, first response / resolution avg+median, SLA, per staff and per channel.
 
 Still open:
 1. **API disabled**: `SUPPORT_INTERNAL_API` / `SUPPORT_INTERNAL_TOKEN` not set (intentional until the bot is ready).
-2. No endpoints for assign/claim, priority, category, team, merge, list/search tickets, find-by-reference.
-3. `GET /attachments/{id}` is not ticket-scoped and ignores internal/sensitive visibility.
-4. Single shared rate bucket (60 req/min per IP); per-author reply limit 10/min.
-5. Message edits/deletes are not supported.
-6. Webhook sends are synchronous best-effort (5s, no retry); disable `support.webhook` once the bot mirrors via the feed.
-7. Feed has no retention/pruning and no backfill of pre-2026-10-06 history.
-8. Metrics: `first_response_at` exists only for tickets after 2026-09-23; derive older values from the first public `staff` message.
+2. No endpoints for merge or server change alone (category endpoint accepts `server_id`); no message edits/deletes.
+3. Single shared rate bucket (60 req/min per IP); per-author reply limit 10/min. Stats/list are not cached — poll sparingly.
+4. Webhook sends are synchronous best-effort (5s, no retry); disable `support.webhook` once the bot mirrors via the feed.
+5. Feed has no backfill of pre-2026-10-06 history; retention 90 days.
+6. Assign/priority/category do not send player notifications (same as the admin panel).
+7. Metrics: `first_response_at` exists only for tickets after 2026-09-23; stats derive older values from the first public `staff` message.

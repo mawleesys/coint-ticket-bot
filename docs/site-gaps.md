@@ -1,4 +1,4 @@
-# Статус пробелов Internal Ticket API (2026-10-06)
+# Статус пробелов Internal Ticket API (2026-10-06, round 2)
 
 Источник: `docs/site-internal-api.md`, раздел 7. Бот выровнен под эту ревизию.
 
@@ -8,23 +8,26 @@
 |---|---|---|
 | #2 permission checks | 403 + `forbidden_*` / `user_banned` / `user_deleted` | Пишем реальный `user_id` staff; 403 показываем в треде |
 | #3 dedupe | unique `(source, external_message_id)`, 200 `duplicate:true`, 409 cross-ticket | Шлём Discord message id; replay не создаёт петлю |
-| #4 / #5 event feed | `GET /events?after_id=&limit=` + `source` | Поллинг ленты, курсор в `data/event-cursor.json`, skip `source=discord` |
+| #4 / #5 event feed | `GET /events?after_id=&limit=` + `source` + retention 90 дней | Поллинг ленты, курсор `afterId`+`lastSyncAt`; stale → resync через list |
 | #6 Discord lookup | `GET /api/internal/users/by-discord/{id}` | Резолв staff; 404/409 — понятное сообщение, **без** заглушки `user_id=1` |
-| #7 payload / categories | ids, owner, dates, attachments, `is_sensitive`; `GET /categories` | Маршрутизация по `is_sensitive`, автор в карточке |
-| #10 references | 200 на тот же тикет, 409 чужой, `move:true` | Линкуем тред без тихого переноса |
-| #11 notify on resolve/close | сайт шлёт игроку | Бот только меняет статус |
+| #7 payload / categories | ids, owner, dates, attachments, `is_sensitive`, `sla_due_at`, `is_overdue` | Карточка, SLA, маршрутизация по `is_sensitive` |
+| #10 references | 200 / 409 / `move:true`; `GET /by-reference` | Линк треда; резолв тикета из треда |
+| #11 notify on resolve/close | сайт шлёт игроку | Кнопки «Решить» / «Закрыть» |
+| claim / assign / unassign | `POST /{ticket}/claim|assign|unassign` | Кнопка «Взять в работу», 403 `forbidden_assign` |
+| priority / category | `POST /{ticket}/priority|category` | Кнопки приоритета; 403 `forbidden_priority` / `forbidden_category` |
+| list / search | `GET /` очереди + `{data, meta}`, `user_id` обязателен | Resync открытых тикетов; 403 `forbidden_view` |
+| scoped attachments | `GET /{ticket}/attachments/{id}` | Предпочтительный путь; `user_id` для internal/sensitive |
+| stats | `GET /stats?from&to&user_id` | Недельный отчёт; локальный расчёт только как fallback |
 
 Флаги `FEATURE_*` по умолчанию **включены**. Выключать имеет смысл только для отката.
 
-## Ещё открыто
+## Ещё открыто (не код API)
 
-1. **API выключен в prod** — нет `SUPPORT_INTERNAL_API` / `SUPPORT_INTERNAL_TOKEN`. Пока 404 на все пути.
-2. **Нет assign / claim / priority / category / team / merge / list / search / find-by-reference.** Кнопки «взять» и смена приоритета некуда слать.
-3. **`GET /attachments/{id}`** не scoped к тикету и не фильтрует internal/sensitive. Бот должен брать id только из `attachments[]` тикета.
-4. **Нет retention/cleanup outbox** и нет бэкапа истории до 2026-10-06. Курсор бота нельзя отматывать в прошлое.
-5. **Старый Discord webhook всё ещё включён.** После этапа 1 его надо выключить (`support.webhook`), иначе дубли в канале. В footer теперь есть `source:` — бот может игнорировать `source: discord`, но треды webhook не создаёт.
-6. Общий rate limit 60 req/min на IP; правки/удаления сообщений API не умеет.
-7. `first_response_at` пуст у тикетов до 2026-09-23 — для статистики брать первое публичное staff-сообщение.
+1. **Включить Internal API в prod** — выставить `SUPPORT_INTERNAL_API` и `SUPPORT_INTERNAL_TOKEN`. Пока 404 на все пути.
+2. **Выключить старый Discord webhook** (`support.webhook`) после стабильного зеркала, иначе дубли в канале.
+3. **Создать Discord-приложение бота** (Developer Portal: intents, форумы, токен, приглашение на сервер).
+
+Остальное из раздела 7 спецификации — ограничения платформы, не блокеры бота: нет merge / правок сообщений, общий rate limit 60 req/min, нет бэкапа ленты до 2026-10-06, assign/priority не шлют игроку уведомление.
 
 ## Что включить на сайте перед продом бота
 

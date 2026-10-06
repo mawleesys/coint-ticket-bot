@@ -184,4 +184,38 @@ export function runDryRunDemo(config: Config, logger: Logger): void {
     },
     '[DRY RUN] Would resolve staff via Discord link and reject unlinked users'
   );
+
+  logger.info(
+    {
+      take: 'POST /{ticket}/claim',
+      priority: 'POST /{ticket}/priority',
+      resolve: 'POST /{ticket}/status resolved',
+      close: 'POST /{ticket}/status closed',
+      actor: 'resolved staff user_id (never a stub)',
+    },
+    '[DRY RUN] Card buttons would call claim / priority / status as the linked staff user'
+  );
+
+  logger.info(
+    {
+      resolveThread: 'GET /by-reference?provider=discord&external_type=thread',
+    },
+    '[DRY RUN] Would resolve a ticket from a Discord thread via by-reference'
+  );
+
+  logger.info(
+    {
+      stats: 'GET /stats?from&to&user_id',
+      fallback: 'local StatsCollector.calculateStats',
+    },
+    '[DRY RUN] Weekly summary would use GET /stats, with local calc only as fallback'
+  );
+
+  logger.info(
+    {
+      retentionDays: config.sync.outboxRetentionDays,
+      resync: 'GET / + GET /{ticket}',
+    },
+    '[DRY RUN] Stale outbox cursor (older than 90d retention) would trigger a list resync'
+  );
 }

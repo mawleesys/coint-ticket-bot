@@ -37,7 +37,10 @@ import {
 import {
   messageForForbidden,
   resolveStaffFromDiscord,
+  type StaffAction,
 } from './staff-resolver.js';
+import { actionFromTicketButton } from './ticket-actions.js';
+import { daysAgo, needsResync, toDateOnly } from './resync.js';
 
 export class SyncEngine {
   private syncInterval: NodeJS.Timeout | null = null;
@@ -56,7 +59,7 @@ export class SyncEngine {
     if (this.config.dryRun) {
       this.logger.info(
         { afterId: this.cursorStore.get() },
-        '[DRY RUN] Sync engine would poll GET /events'
+        '[DRY RUN] Sync engine would poll GET /events and resync if the cursor is stale'
       );
       return;
     }
@@ -96,6 +99,10 @@ export class SyncEngine {
     }
 
     try {
+      if (await this.cursorNeedsResync()) {
+        await this.resyncFromList();
+      }
+
       let hasMore = true;
       while (hasMore) {
         const page = await this.siteApi.getEvents(
@@ -114,9 +121,89 @@ export class SyncEngine {
 
         hasMore = page.has_more && page.data.length > 0;
       }
+
+      this.cursorStore.markSynced();
     } catch (error) {
       this.logger.error({ error }, 'Site → Discord sync failed');
     }
+  }
+
+  private async cursorNeedsResync(): Promise<boolean> {
+    const peek = await this.siteApi.getEvents(0, 1);
+    const oldest = peek.data[0]?.id ?? null;
+    return needsResync({
+      afterId: this.cursorStore.get(),
+      lastSyncAt: this.cursorStore.getLastSyncAt(),
+      oldestEventId: oldest,
+      retentionDays: this.config.sync.outboxRetentionDays,
+    });
+  }
+
+  private async resyncFromList(): Promise<void> {
+    const userId = this.config.site.actorUserId;
+    this.logger.warn(
+      {
+        afterId: this.cursorStore.get(),
+        lastSyncAt: this.cursorStore.getLastSyncAt()?.toISOString() ?? null,
+        actorUserId: userId ?? null,
+      },
+      'Outbox cursor stale — resync via GET / + GET /{ticket}'
+    );
+
+    if (!this.config.features.ticketList || !userId) {
+      this.logger.warn(
+        'Cannot list tickets for resync (need FEATURE_TICKET_LIST and SITE_ACTOR_USER_ID)'
+      );
+      await this.jumpCursorToLatest();
+      return;
+    }
+
+    const from = toDateOnly(daysAgo(this.config.sync.outboxRetentionDays));
+    let page = 1;
+    let lastPage = 1;
+
+    do {
+      const result = await this.siteApi.listTickets({
+        user_id: userId,
+        queue: 'all',
+        from,
+        page,
+        per_page: 100,
+      });
+
+      for (const item of result.data) {
+        const ticket = await this.siteApi.getTicket(item.public_number, true);
+        if (this.mappingStore.hasTicket(ticket.public_number)) {
+          await this.updateThreadFromTicket(ticket);
+        } else {
+          await this.mirrorTicketToDiscord(ticket);
+        }
+      }
+
+      lastPage = result.meta.last_page;
+      page += 1;
+    } while (page <= lastPage);
+
+    await this.jumpCursorToLatest();
+  }
+
+  private async jumpCursorToLatest(): Promise<void> {
+    let after = 0;
+    let hasMore = true;
+
+    while (hasMore) {
+      const page = await this.siteApi.getEvents(after, 500);
+      if (page.next_after_id > after) {
+        after = page.next_after_id;
+      }
+      hasMore = page.has_more && page.data.length > 0;
+      if (page.data.length === 0) {
+        break;
+      }
+    }
+
+    this.cursorStore.set(after);
+    this.cursorStore.markSynced();
   }
 
   async handleSiteEvent(event: OutboxEvent): Promise<void> {
@@ -291,13 +378,68 @@ export class SyncEngine {
     });
   }
 
+  /**
+   * Тикет по треду: сначала память, затем GET /by-reference.
+   */
+  async resolveTicketNumber(
+    threadId: string,
+    viewerUserId?: number
+  ): Promise<string | undefined> {
+    const mapped = this.mappingStore.getTicketByThread(threadId);
+    if (mapped) {
+      return mapped;
+    }
+
+    try {
+      const ticket = await this.siteApi.getByReference({
+        provider: 'discord',
+        external_type: 'thread',
+        external_id: threadId,
+        user_id: viewerUserId ?? this.config.site.actorUserId,
+      });
+      this.rememberMapping(ticket, threadId);
+      return ticket.public_number;
+    } catch (error) {
+      if (
+        error instanceof TicketApiError &&
+        (error.code === 'reference_not_found' ||
+          error.code === 'reference_ambiguous' ||
+          error.code === 'forbidden_view')
+      ) {
+        this.logger.warn(
+          { threadId, code: error.code },
+          'Cannot resolve ticket by Discord thread reference'
+        );
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  private rememberMapping(ticket: Ticket, threadId: string): void {
+    if (this.mappingStore.hasThread(threadId)) {
+      return;
+    }
+    const isConfidential = isTicketConfidential(ticket);
+    this.mappingStore.set({
+      ticketNumber: ticket.public_number,
+      threadId,
+      channelId: isConfidential
+        ? this.config.discord.confidentialForumChannelId
+        : this.config.discord.forumChannelId,
+      isConfidential,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+  }
+
   async handleDiscordMessage(
     threadId: string,
     messageId: string,
     authorId: string,
     content: string
   ): Promise<{ notice?: string }> {
-    const ticketNumber = this.mappingStore.getTicketByThread(threadId);
+    const ticketNumber = await this.resolveTicketNumber(threadId);
     if (!ticketNumber) {
       return {};
     }
@@ -311,7 +453,7 @@ export class SyncEngine {
       return {};
     }
 
-    const action = parsed.isInternal ? 'internal_note' : 'reply';
+    const action: StaffAction = parsed.isInternal ? 'internal_note' : 'reply';
     const resolved = await resolveStaffFromDiscord(
       this.siteApi,
       authorId,
@@ -364,21 +506,26 @@ export class SyncEngine {
     }
   }
 
-  async handleStatusButton(
+  async handleTicketButton(
     threadId: string,
     discordUserId: string,
-    newStatus: TicketStatus
+    buttonId: string
   ): Promise<{ notice?: string }> {
-    const ticketNumber = this.mappingStore.getTicketByThread(threadId);
-    if (!ticketNumber) {
-      return {};
+    const action = actionFromTicketButton(buttonId);
+    if (action.kind === 'unknown') {
+      return { notice: 'Неизвестная кнопка.' };
     }
 
-    const action = newStatus === TicketStatus.Closed ? 'close' : 'change_status';
+    if (action.kind === 'status') {
+      return this.handleStatusButton(threadId, discordUserId, action.status);
+    }
+
+    const staffAction: StaffAction =
+      action.kind === 'claim' ? 'assign' : 'change_priority';
     const resolved = await resolveStaffFromDiscord(
       this.siteApi,
       discordUserId,
-      action,
+      staffAction,
       this.config.site.url
     );
 
@@ -387,16 +534,104 @@ export class SyncEngine {
       return { notice: resolved.reason };
     }
 
-    await this.siteApi.changeStatus(ticketNumber, {
-      status: newStatus,
-      user_id: resolved.user.user_id,
-      source: TicketSource.Discord,
-    });
-
-    this.logger.info(
-      { ticket: ticketNumber, newStatus, userId: resolved.user.user_id },
-      'Changed ticket status from Discord'
+    const ticketNumber = await this.resolveTicketNumber(
+      threadId,
+      resolved.user.user_id
     );
-    return {};
+    if (!ticketNumber) {
+      const notice = 'Тикет для этого треда не найден на сайте.';
+      await this.threadManager.postSystemNotice(threadId, notice);
+      return { notice };
+    }
+
+    try {
+      const ticket =
+        action.kind === 'claim'
+          ? await this.siteApi.claimTicket(ticketNumber, {
+              user_id: resolved.user.user_id,
+              source: TicketSource.Discord,
+            })
+          : await this.siteApi.setPriority(ticketNumber, {
+              user_id: resolved.user.user_id,
+              priority: action.priority,
+              source: TicketSource.Discord,
+            });
+
+      await this.updateThreadFromTicket(ticket);
+
+      const notice =
+        action.kind === 'claim'
+          ? `Тикет ${ticketNumber} взят в работу.`
+          : `Приоритет ${ticketNumber}: ${ticket.priority}.`;
+
+      this.logger.info(
+        {
+          ticket: ticketNumber,
+          buttonId,
+          userId: resolved.user.user_id,
+        },
+        'Applied ticket card button'
+      );
+      return { notice };
+    } catch (error) {
+      if (error instanceof TicketApiError) {
+        const notice = messageForForbidden(error.code);
+        await this.threadManager.postSystemNotice(threadId, notice);
+        return { notice };
+      }
+      throw error;
+    }
+  }
+
+  async handleStatusButton(
+    threadId: string,
+    discordUserId: string,
+    newStatus: TicketStatus
+  ): Promise<{ notice?: string }> {
+    const staffAction: StaffAction =
+      newStatus === TicketStatus.Closed ? 'close' : 'change_status';
+    const resolved = await resolveStaffFromDiscord(
+      this.siteApi,
+      discordUserId,
+      staffAction,
+      this.config.site.url
+    );
+
+    if (!resolved.ok) {
+      await this.threadManager.postSystemNotice(threadId, resolved.reason);
+      return { notice: resolved.reason };
+    }
+
+    const ticketNumber = await this.resolveTicketNumber(
+      threadId,
+      resolved.user.user_id
+    );
+    if (!ticketNumber) {
+      const notice = 'Тикет для этого треда не найден на сайте.';
+      await this.threadManager.postSystemNotice(threadId, notice);
+      return { notice };
+    }
+
+    try {
+      const ticket = await this.siteApi.changeStatus(ticketNumber, {
+        status: newStatus,
+        user_id: resolved.user.user_id,
+        source: TicketSource.Discord,
+      });
+      await this.updateThreadFromTicket(ticket);
+
+      this.logger.info(
+        { ticket: ticketNumber, newStatus, userId: resolved.user.user_id },
+        'Changed ticket status from Discord'
+      );
+      return { notice: `Статус ${ticketNumber}: ${ticket.status}.` };
+    } catch (error) {
+      if (error instanceof TicketApiError) {
+        const notice = messageForForbidden(error.code);
+        await this.threadManager.postSystemNotice(threadId, notice);
+        return { notice };
+      }
+      throw error;
+    }
   }
 }

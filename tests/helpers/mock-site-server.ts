@@ -125,11 +125,100 @@ export async function startMockSiteServer(): Promise<MockSiteServer> {
         created_at: '2026-10-06T10:00:00+05:00',
       },
     ],
-    attachments: [],
-    references: [],
+    attachments: [
+      {
+        id: 55,
+        message_id: 901,
+        original_name: 'latest.log',
+        mime_type: 'text/plain',
+        size: 20480,
+        created_at: '2026-10-06T10:00:00+05:00',
+      },
+    ],
+    references: [
+      {
+        provider: 'discord',
+        external_type: 'thread',
+        external_id: 'thread-1207',
+      },
+    ],
+    sla_due_at: '2026-10-07T10:00:00+05:00',
+    is_overdue: false,
+    last_activity_at: '2026-10-06T10:05:00+05:00',
+    first_response_at: null,
     nextMessageId: 902,
   };
   tickets.set(seed.public_number, seed);
+  references.set('discord:thread:thread-1207', {
+    ticket: seed.public_number,
+    id: nextRefId++,
+  });
+  references.set('discord:message:thread-1207', {
+    ticket: 'COINT-1208',
+    id: nextRefId++,
+  });
+
+  const sensitive: StoredTicket = {
+    id: 208,
+    public_number: 'COINT-1208',
+    status: TicketStatus.Open,
+    priority: TicketPriority.High,
+    source: TicketSource.Website,
+    subject: 'Жалоба на модератора',
+    category: 'staff_complaint',
+    category_name: 'Жалоба на администрацию',
+    is_sensitive: true,
+    team: 'senior_admins',
+    owner_user_id: 50,
+    assignee_user_id: null,
+    created_at: '2026-10-06T11:00:00+05:00',
+    updated_at: '2026-10-06T11:00:00+05:00',
+    sla_due_at: '2026-10-06T15:00:00+05:00',
+    is_overdue: false,
+    last_activity_at: '2026-10-06T11:00:00+05:00',
+    messages: [
+      {
+        id: 1,
+        body: 'Скрытый текст',
+        is_internal: false,
+        author_type: TicketAuthorType.User,
+        author_user_id: 50,
+        source: TicketSource.Website,
+        external_message_id: null,
+        created_at: '2026-10-06T11:00:00+05:00',
+      },
+      {
+        id: 2,
+        body: 'Внутренняя заметка',
+        is_internal: true,
+        author_type: TicketAuthorType.Staff,
+        author_user_id: 45,
+        source: TicketSource.Website,
+        external_message_id: null,
+        created_at: '2026-10-06T11:05:00+05:00',
+      },
+    ],
+    attachments: [
+      {
+        id: 56,
+        message_id: 2,
+        original_name: 'note.txt',
+        mime_type: 'text/plain',
+        size: 12,
+        created_at: '2026-10-06T11:05:00+05:00',
+      },
+    ],
+    references: [
+      {
+        provider: 'discord',
+        external_type: 'message',
+        external_id: 'thread-1207',
+      },
+    ],
+    nextMessageId: 3,
+  };
+  tickets.set(sensitive.public_number, sensitive);
+  nextTicketId = 209;
 
   const pushEvent = (
     event: Omit<OutboxEvent, 'id'> & { id?: number }
@@ -219,6 +308,100 @@ export async function startMockSiteServer(): Promise<MockSiteServer> {
           data: slice,
           next_after_id: last,
           has_more: events.some((event) => event.id > last),
+        });
+        return;
+      }
+
+      if (req.method === 'GET' && relative === '/by-reference') {
+        const provider = url.searchParams.get('provider') ?? '';
+        const externalId = url.searchParams.get('external_id') ?? '';
+        const externalType = url.searchParams.get('external_type');
+        const viewer = url.searchParams.get('user_id');
+        if (!provider || !externalId) {
+          send(res, 422, { message: 'The given data was invalid.' });
+          return;
+        }
+        if (viewer === '8') {
+          send(res, 403, { message: 'Cannot view.', code: 'forbidden_view' });
+          return;
+        }
+        const matches = [...references.entries()].filter(([key, value]) => {
+          const [prov, type, id] = key.split(':');
+          if (prov !== provider || id !== externalId) {
+            return false;
+          }
+          if (externalType && type !== externalType) {
+            return false;
+          }
+          return Boolean(tickets.get(value.ticket));
+        });
+        const uniqueTickets = [...new Set(matches.map(([, value]) => value.ticket))];
+        if (uniqueTickets.length === 0) {
+          send(res, 404, { message: 'Not found.', code: 'reference_not_found' });
+          return;
+        }
+        if (uniqueTickets.length > 1) {
+          send(res, 409, {
+            message: 'Ambiguous reference.',
+            code: 'reference_ambiguous',
+            ticket_numbers: uniqueTickets,
+          });
+          return;
+        }
+        const ticket = tickets.get(uniqueTickets[0]);
+        if (!ticket) {
+          send(res, 404, { message: 'Not found.', code: 'reference_not_found' });
+          return;
+        }
+        const includeInternal = ['1', 'true'].includes(
+          url.searchParams.get('include_internal') ?? ''
+        );
+        send(res, 200, toPayload(ticket, includeInternal));
+        return;
+      }
+
+      if (req.method === 'GET' && relative === '/stats') {
+        const viewer = url.searchParams.get('user_id');
+        if (viewer === '8') {
+          send(res, 403, { message: 'No stats.', code: 'forbidden_stats' });
+          return;
+        }
+        send(res, 200, mockStatsFixture());
+        return;
+      }
+
+      if (req.method === 'GET' && relative === '/') {
+        const userId = url.searchParams.get('user_id');
+        if (!userId) {
+          send(res, 422, {
+            message: 'The given data was invalid.',
+            errors: { user_id: ['Поле обязательно.'] },
+          });
+          return;
+        }
+        if (userId === '8') {
+          send(res, 403, { message: 'Cannot view.', code: 'forbidden_view' });
+          return;
+        }
+        const queue = url.searchParams.get('queue') ?? 'all';
+        const q = (url.searchParams.get('q') ?? '').toLowerCase();
+        const page = Math.max(Number(url.searchParams.get('page') ?? '1'), 1);
+        const perPage = Math.min(
+          Math.max(Number(url.searchParams.get('per_page') ?? '30'), 1),
+          100
+        );
+        const filtered = [...tickets.values()].filter((ticket) => {
+          if (q && !ticket.public_number.toLowerCase().includes(q) && !ticket.subject.toLowerCase().includes(q)) {
+            return false;
+          }
+          return matchesQueue(ticket, queue, Number(userId));
+        });
+        const total = filtered.length;
+        const lastPage = Math.max(Math.ceil(total / perPage), 1);
+        const slice = filtered.slice((page - 1) * perPage, page * perPage);
+        send(res, 200, {
+          data: slice.map((ticket) => toSummary(ticket)),
+          meta: { page, per_page: perPage, total, last_page: lastPage },
         });
         return;
       }
@@ -543,6 +726,178 @@ export async function startMockSiteServer(): Promise<MockSiteServer> {
         return;
       }
 
+      const claim = /^\/([^/]+)\/claim$/.exec(relative);
+      if (req.method === 'POST' && claim) {
+        const ticket = resolveTicket(tickets, decodeURIComponent(claim[1]));
+        if (!ticket) {
+          send(res, 404, { message: 'Ticket not found' });
+          return;
+        }
+        const body = JSON.parse(await parseBody(req)) as { user_id?: number };
+        if (!body.user_id) {
+          send(res, 422, {
+            message: 'The given data was invalid.',
+            errors: { user_id: ['Поле обязательно.'] },
+          });
+          return;
+        }
+        if (body.user_id === 9) {
+          send(res, 403, { message: 'No assign.', code: 'forbidden_assign' });
+          return;
+        }
+        ticket.assignee_user_id = body.user_id;
+        send(res, 200, toPayload(ticket, false));
+        return;
+      }
+
+      const assign = /^\/([^/]+)\/assign$/.exec(relative);
+      if (req.method === 'POST' && assign) {
+        const ticket = resolveTicket(tickets, decodeURIComponent(assign[1]));
+        if (!ticket) {
+          send(res, 404, { message: 'Ticket not found' });
+          return;
+        }
+        const body = JSON.parse(await parseBody(req)) as {
+          user_id?: number;
+          assignee_user_id?: number | null;
+          team?: string | null;
+        };
+        if (body.user_id === 9) {
+          send(res, 403, { message: 'No assign.', code: 'forbidden_assign' });
+          return;
+        }
+        if (body.assignee_user_id === undefined && body.team === undefined) {
+          send(res, 422, {
+            message: 'The given data was invalid.',
+            errors: { assignee_user_id: ['Укажите исполнителя или команду.'] },
+          });
+          return;
+        }
+        if (body.assignee_user_id !== undefined) {
+          ticket.assignee_user_id = body.assignee_user_id;
+        }
+        if (body.team !== undefined) {
+          ticket.team = body.team;
+        }
+        send(res, 200, toPayload(ticket, false));
+        return;
+      }
+
+      const unassign = /^\/([^/]+)\/unassign$/.exec(relative);
+      if (req.method === 'POST' && unassign) {
+        const ticket = resolveTicket(tickets, decodeURIComponent(unassign[1]));
+        if (!ticket) {
+          send(res, 404, { message: 'Ticket not found' });
+          return;
+        }
+        const body = JSON.parse(await parseBody(req)) as { user_id?: number };
+        if (body.user_id === 9) {
+          send(res, 403, { message: 'No assign.', code: 'forbidden_assign' });
+          return;
+        }
+        ticket.assignee_user_id = null;
+        send(res, 200, toPayload(ticket, false));
+        return;
+      }
+
+      const priority = /^\/([^/]+)\/priority$/.exec(relative);
+      if (req.method === 'POST' && priority) {
+        const ticket = resolveTicket(tickets, decodeURIComponent(priority[1]));
+        if (!ticket) {
+          send(res, 404, { message: 'Ticket not found' });
+          return;
+        }
+        const body = JSON.parse(await parseBody(req)) as {
+          user_id?: number;
+          priority?: TicketPriority;
+        };
+        if (body.user_id === 9) {
+          send(res, 403, { message: 'No priority.', code: 'forbidden_priority' });
+          return;
+        }
+        if (!body.priority) {
+          send(res, 422, {
+            message: 'The given data was invalid.',
+            errors: { priority: ['Поле обязательно.'] },
+          });
+          return;
+        }
+        ticket.priority = body.priority;
+        ticket.sla_due_at = slaDueForPriority(body.priority, ticket.created_at);
+        send(res, 200, toPayload(ticket, false));
+        return;
+      }
+
+      const category = /^\/([^/]+)\/category$/.exec(relative);
+      if (req.method === 'POST' && category) {
+        const ticket = resolveTicket(tickets, decodeURIComponent(category[1]));
+        if (!ticket) {
+          send(res, 404, { message: 'Ticket not found' });
+          return;
+        }
+        const body = JSON.parse(await parseBody(req)) as {
+          user_id?: number;
+          category_key?: string;
+          server_id?: number;
+        };
+        if (body.user_id === 9) {
+          send(res, 403, { message: 'No category.', code: 'forbidden_category' });
+          return;
+        }
+        if (!body.category_key) {
+          send(res, 422, { message: 'Unknown category.' });
+          return;
+        }
+        ticket.category = body.category_key;
+        ticket.is_sensitive = body.category_key === 'staff_complaint';
+        if (body.server_id !== undefined) {
+          ticket.server_id = body.server_id;
+        }
+        send(res, 200, toPayload(ticket, false));
+        return;
+      }
+
+      const scopedAttachment = /^\/([^/]+)\/attachments\/([^/]+)$/.exec(relative);
+      if (req.method === 'GET' && scopedAttachment) {
+        const ticket = resolveTicket(
+          tickets,
+          decodeURIComponent(scopedAttachment[1])
+        );
+        if (!ticket) {
+          send(res, 404, { message: 'Ticket not found' });
+          return;
+        }
+        const attachmentId = Number(scopedAttachment[2]);
+        const attachment = (ticket.attachments ?? []).find(
+          (item) => item.id === attachmentId
+        );
+        if (!attachment) {
+          send(res, 404, { message: 'Attachment not found' });
+          return;
+        }
+        const userId = url.searchParams.get('user_id');
+        const parent = ticket.messages.find(
+          (message) => message.id === attachment.message_id
+        );
+        if (!userId && (ticket.is_sensitive || parent?.is_internal)) {
+          send(res, 403, { message: 'user_id required.', code: 'user_required' });
+          return;
+        }
+        if (userId === '9' && (ticket.is_sensitive || parent?.is_internal)) {
+          send(res, 403, {
+            message: 'Cannot download.',
+            code: 'forbidden_attachment_download',
+          });
+          return;
+        }
+        res.writeHead(200, {
+          'Content-Disposition': `attachment; filename=${attachment.original_name}`,
+          'Content-Type': attachment.mime_type,
+        });
+        res.end('mock-file');
+        return;
+      }
+
       if (req.method === 'POST' && /\/attachments$/.test(relative)) {
         res.writeHead(201, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ id: 55 }));
@@ -550,6 +905,12 @@ export async function startMockSiteServer(): Promise<MockSiteServer> {
       }
 
       if (req.method === 'GET' && relative.startsWith('/attachments/')) {
+        const userId = url.searchParams.get('user_id');
+        const attachmentId = Number(relative.split('/').pop());
+        if (attachmentId === 56 && !userId) {
+          send(res, 403, { message: 'user_id required.', code: 'user_required' });
+          return;
+        }
         res.writeHead(200, {
           'Content-Disposition': 'attachment; filename=log.txt',
         });
@@ -597,6 +958,116 @@ function resolveTicket(
   }
   const legacy = key.replace(/^COI-/, 'COINT-');
   return legacy !== key ? tickets.get(legacy) : undefined;
+}
+
+function matchesQueue(
+  ticket: StoredTicket,
+  queue: string,
+  userId: number
+): boolean {
+  const active = new Set([
+    TicketStatus.Open,
+    TicketStatus.InProgress,
+    TicketStatus.WaitingForStaff,
+    TicketStatus.WaitingForUser,
+  ]);
+  switch (queue) {
+    case 'inbox':
+      return active.has(ticket.status);
+    case 'mine':
+      return active.has(ticket.status) && ticket.assignee_user_id === userId;
+    case 'unassigned':
+      return active.has(ticket.status) && ticket.assignee_user_id == null;
+    case 'waiting-user':
+      return ticket.status === TicketStatus.WaitingForUser;
+    case 'waiting-staff':
+      return ticket.status === TicketStatus.WaitingForStaff;
+    case 'overdue':
+      return Boolean(ticket.is_overdue);
+    case 'resolved':
+      return (
+        ticket.status === TicketStatus.Resolved ||
+        ticket.status === TicketStatus.Closed
+      );
+    default:
+      return true;
+  }
+}
+
+function toSummary(ticket: StoredTicket) {
+  return {
+    id: ticket.id ?? 0,
+    public_number: ticket.public_number,
+    status: ticket.status,
+    priority: ticket.priority,
+    source: ticket.source,
+    subject: ticket.subject,
+    category: ticket.category,
+    category_name: ticket.category_name,
+    is_sensitive: ticket.is_sensitive,
+    team: ticket.team,
+    owner_user_id: ticket.owner_user_id,
+    assignee_user_id: ticket.assignee_user_id,
+    created_at: ticket.created_at,
+    first_response_at: ticket.first_response_at ?? null,
+    last_activity_at: ticket.last_activity_at,
+    sla_due_at: ticket.sla_due_at ?? null,
+    is_overdue: Boolean(ticket.is_overdue),
+    references: ticket.references,
+  };
+}
+
+function slaDueForPriority(priority: TicketPriority, createdAt?: string): string {
+  const minutes: Record<TicketPriority, number> = {
+    [TicketPriority.Low]: 2880,
+    [TicketPriority.Normal]: 1440,
+    [TicketPriority.High]: 240,
+    [TicketPriority.Urgent]: 60,
+  };
+  const start = createdAt ? new Date(createdAt) : new Date();
+  return new Date(start.getTime() + minutes[priority] * 60 * 1000).toISOString();
+}
+
+function mockStatsFixture() {
+  return {
+    period: { from: '2026-09-06', to: '2026-10-06' },
+    tickets: {
+      created: 120,
+      by_status: { open: 10, resolved: 80, closed: 15 },
+      by_priority: { normal: 100, high: 20 },
+      by_source: { website: 90, discord: 30 },
+      by_category: { technical: 40 },
+      without_staff_reply: 5,
+    },
+    first_response: { count: 110, avg_seconds: 5400, median_seconds: 1800 },
+    resolution: { count: 95, avg_seconds: 86400, median_seconds: 43200 },
+    sla: {
+      measured: 110,
+      met: 100,
+      breached: 10,
+      pending: 3,
+      met_rate: 0.9091,
+      targets_minutes: { low: 2880, normal: 1440, high: 240, urgent: 60 },
+    },
+    by_channel: {
+      replies: { website: 300, discord: 80 },
+      first_responses: { website: 90, discord: 20 },
+    },
+    by_staff: [
+      {
+        user_id: 45,
+        name: 'Helper',
+        role: 'Хелпер',
+        replies: 50,
+        tickets_replied: 30,
+        replies_by_source: { website: 40, discord: 10 },
+        first_responses: 20,
+        first_response: { count: 20, avg_seconds: 3600, median_seconds: 1500 },
+        resolved: 15,
+        closed: 3,
+      },
+    ],
+  };
 }
 
 function toPayload(ticket: StoredTicket, includeInternal: boolean): Ticket {

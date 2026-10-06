@@ -77,5 +77,26 @@ describe('staff resolver', () => {
   it('maps forbidden_* codes', () => {
     expect(messageForForbidden('forbidden_internal_note')).toMatch(/внутренн/);
     expect(messageForForbidden('user_banned')).toMatch(/заблокирован/);
+    expect(messageForForbidden('forbidden_assign')).toMatch(/назнач/);
+    expect(messageForForbidden('forbidden_priority')).toMatch(/приоритет/);
+    expect(messageForForbidden('forbidden_category')).toMatch(/категор/);
+    expect(messageForForbidden('forbidden_view')).toMatch(/видеть/);
+    expect(messageForForbidden('forbidden_attachment_download')).toMatch(
+      /скачиван/
+    );
+    expect(messageForForbidden('user_required')).toMatch(/вложен/);
+  });
+
+  it('checks assign and priority permissions', () => {
+    expect(evaluateStaffAction(user(), 'assign').ok).toBe(true);
+    expect(evaluateStaffAction(user(), 'change_priority').ok).toBe(true);
+    const noAssign = evaluateStaffAction(
+      user({ permissions: { ...user().permissions, can_assign: false } }),
+      'assign'
+    );
+    expect(noAssign.ok).toBe(false);
+    if (!noAssign.ok) {
+      expect(noAssign.reason).toMatch(/назнач|assign/);
+    }
   });
 });

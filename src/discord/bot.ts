@@ -2,7 +2,13 @@
  * Главный Discord бот для синхронизации тикетов COINT
  */
 
-import { Client, GatewayIntentBits, Events, type Message } from 'discord.js';
+import {
+  Client,
+  GatewayIntentBits,
+  Events,
+  type ButtonInteraction,
+  type Message,
+} from 'discord.js';
 import type { Logger } from 'pino';
 import type { Config } from '../config/index.js';
 import { SiteApiClient } from '../api/site-client.js';
@@ -24,6 +30,8 @@ export class TicketBot {
   private statsCollector: StatsCollector;
   private cursorStore: EventCursorStore;
   private cleanupInterval: NodeJS.Timeout | null = null;
+  private statsInterval: NodeJS.Timeout | null = null;
+  private lastWeeklyKey: string | null = null;
 
   constructor(
     private readonly config: Config,
@@ -95,6 +103,11 @@ export class TicketBot {
       this.cleanupInterval = null;
     }
 
+    if (this.statsInterval) {
+      clearInterval(this.statsInterval);
+      this.statsInterval = null;
+    }
+
     if (!this.config.dryRun) {
       await this.client.destroy();
     }
@@ -117,6 +130,7 @@ export class TicketBot {
         .then(() => {
           this.syncEngine.start();
           this.cleanupInterval = this.dedupeGuard.startCleanupInterval();
+          this.startWeeklyStatsScheduler();
           this.logger.info('Bot fully initialized and ready');
         })
         .catch((error) => {
@@ -131,7 +145,7 @@ export class TicketBot {
 
     this.client.on(Events.InteractionCreate, (interaction) => {
       if (interaction.isButton()) {
-        void this.handleButtonClick(interaction as never);
+        void this.handleButtonClick(interaction);
       }
     });
 
@@ -163,29 +177,21 @@ export class TicketBot {
       if (!message.channel.isThread()) return;
 
       const threadId = message.channel.id;
-      const ticketNumber = this.mappingStore.getTicketByThread(threadId);
-
-      if (!ticketNumber) {
-        this.logger.trace(
-          { threadId },
-          'Message in non-ticket thread, ignoring'
-        );
-        return;
-      }
-
-      // Синхронизируем с сайтом
-      await this.syncEngine.handleDiscordMessage(
+      const result = await this.syncEngine.handleDiscordMessage(
         threadId,
         message.id,
         message.author.id,
         message.content
       );
 
-      // TODO: Обрабатываем вложения
+      if (result.notice) {
+        return;
+      }
+
       if (message.attachments.size > 0) {
         this.logger.debug(
           {
-            ticket: ticketNumber,
+            threadId,
             attachmentCount: message.attachments.size,
           },
           'Message has attachments (not yet implemented)'
@@ -196,8 +202,94 @@ export class TicketBot {
     }
   }
 
-  private handleButtonClick(_interaction: never): void {
-    this.logger.info('Button clicked (handler not yet implemented)');
+  private async handleButtonClick(interaction: ButtonInteraction): Promise<void> {
+    if (!interaction.channel?.isThread()) {
+      await interaction.reply({
+        content: 'Кнопки тикета работают только внутри треда.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      const result = await this.syncEngine.handleTicketButton(
+        interaction.channel.id,
+        interaction.user.id,
+        interaction.customId
+      );
+      await interaction.editReply({
+        content: result.notice ?? 'Готово.',
+      });
+    } catch (error) {
+      this.logger.error(
+        { error, customId: interaction.customId },
+        'Failed to handle ticket button'
+      );
+      await interaction.editReply({
+        content: 'Не удалось выполнить действие. Попробуйте позже.',
+      });
+    }
+  }
+
+  private startWeeklyStatsScheduler(): void {
+    if (!this.config.stats.enabled) {
+      return;
+    }
+
+    this.statsInterval = setInterval(() => {
+      void this.maybePostWeeklyStats();
+    }, 60 * 60 * 1000);
+
+    void this.maybePostWeeklyStats();
+  }
+
+  private async maybePostWeeklyStats(): Promise<void> {
+    if (!this.config.stats.enabled) {
+      return;
+    }
+
+    const now = new Date();
+    if (now.getUTCDay() !== this.config.stats.weeklyReportDay) {
+      return;
+    }
+    if (now.getUTCHours() !== this.config.stats.weeklyReportHour) {
+      return;
+    }
+
+    const key = now.toISOString().slice(0, 10);
+    if (this.lastWeeklyKey === key) {
+      return;
+    }
+    this.lastWeeklyKey = key;
+
+    try {
+      const summary = await this.statsCollector.getWeeklySummary(
+        this.siteApi,
+        this.config.site.actorUserId
+      );
+      this.logger.info(
+        { source: summary.source, preview: summary.text.slice(0, 80) },
+        'Weekly support stats ready'
+      );
+
+      const channelId = this.config.discord.statsChannelId;
+      if (!channelId || this.config.dryRun) {
+        return;
+      }
+
+      const channel = await this.client.channels.fetch(channelId);
+      if (
+        channel &&
+        'send' in channel &&
+        typeof channel.send === 'function'
+      ) {
+        await channel.send({ content: summary.text.slice(0, 2000) });
+      }
+    } catch (error) {
+      this.logger.error({ error }, 'Failed to publish weekly stats');
+    }
   }
 
   // ====================================
