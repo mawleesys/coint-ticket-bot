@@ -16,7 +16,10 @@ import {
   PRIORITY_TAG_NAMES,
   STATUS_TAG_NAMES,
 } from '../types/discord.js';
-import { isConfidentialCategory } from '../routing/confidentiality.js';
+import {
+  isConfidentialCategory,
+  isTicketConfidential,
+} from '../routing/confidentiality.js';
 
 export type MirrorKind = 'create_thread' | 'post_message' | 'update_tags';
 
@@ -54,7 +57,7 @@ export function redactConfidentialText(text: string, categoryKey: string): strin
 
 export function mapCreatedTicketToThreadDraft(ticket: Ticket): DiscordMirrorDraft {
   const firstPublic = ticket.messages.find((message) => !message.is_internal);
-  const confidential = isConfidentialCategory(ticket.category);
+  const confidential = isTicketConfidential(ticket);
 
   return {
     kind: 'create_thread',

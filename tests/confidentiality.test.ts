@@ -70,4 +70,10 @@ describe('confidentiality routing', () => {
     expect(draft.channel).toBe('confidential');
     expect(draft.channel).not.toBe('public');
   });
+
+  it('trusts is_sensitive from the API over the category key', () => {
+    const route = routeTicketToForum('other', channels, true);
+    expect(route.isConfidential).toBe(true);
+    expect(route.channelId).toBe('confidential-forum');
+  });
 });

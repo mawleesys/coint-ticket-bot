@@ -1,9 +1,6 @@
 /**
  * Маршрутизация конфиденциальных тикетов.
- *
- * Сайт не отдаёт is_sensitive в payload (gap #7), поэтому бот решает
- * по ключу категории. Жалобы на администрацию никогда не зеркалируются
- * в общий форум.
+ * Предпочитаем `is_sensitive` из API; ключ категории — запасной путь.
  */
 
 import { KNOWN_CATEGORIES } from '../types/api.js';
@@ -29,15 +26,30 @@ export function isConfidentialCategory(categoryKey: string): boolean {
   return (CONFIDENTIAL_CATEGORY_KEYS as readonly string[]).includes(categoryKey);
 }
 
+export function isTicketConfidential(ticket: {
+  is_sensitive?: boolean;
+  category: string;
+}): boolean {
+  if (typeof ticket.is_sensitive === 'boolean') {
+    return ticket.is_sensitive;
+  }
+  return isConfidentialCategory(ticket.category);
+}
+
 /**
  * Выбирает форум для тикета. Конфиденциальные категории идут только
  * в закрытый канал; обычные — только в общий.
  */
 export function routeTicketToForum(
   categoryKey: string,
-  channels: ForumChannelIds
+  channels: ForumChannelIds,
+  isSensitive?: boolean
 ): TicketRoute {
-  if (isConfidentialCategory(categoryKey)) {
+  const confidential =
+    typeof isSensitive === 'boolean'
+      ? isSensitive
+      : isConfidentialCategory(categoryKey);
+  if (confidential) {
     return {
       channelId: channels.confidentialForumChannelId,
       isConfidential: true,

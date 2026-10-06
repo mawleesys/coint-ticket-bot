@@ -1,11 +1,7 @@
 /**
- * Типы данных для Internal Ticket API сайта COINT
- * Основано на спецификации site-internal-api.md
+ * Типы Internal Ticket API сайта COINT.
+ * Источник истины: docs/site-internal-api.md (обновлено 2026-10-06).
  */
-
-// ====================================
-// Enums
-// ====================================
 
 export enum TicketStatus {
   Open = 'open',
@@ -37,6 +33,7 @@ export enum TicketAuthorType {
 
 export enum TicketEventType {
   Created = 'created',
+  MessageCreated = 'message_created',
   Assigned = 'assigned',
   Unassigned = 'unassigned',
   TeamChanged = 'team_changed',
@@ -51,9 +48,19 @@ export enum TicketEventType {
   Merged = 'merged',
 }
 
-// ====================================
-// API Request/Response Types
-// ====================================
+export type ApiErrorCode =
+  | 'forbidden_reply'
+  | 'forbidden_internal_note'
+  | 'forbidden_status'
+  | 'forbidden_attachment'
+  | 'forbidden_create'
+  | 'user_banned'
+  | 'user_deleted'
+  | 'external_message_conflict'
+  | 'reference_conflict'
+  | 'discord_link_conflict'
+  | 'discord_not_linked'
+  | 'invalid_discord_id';
 
 export interface CreateTicketRequest {
   user_id: number;
@@ -63,28 +70,6 @@ export interface CreateTicketRequest {
   server_id?: number;
   fields?: Record<string, unknown>;
   source?: TicketSource;
-}
-
-export interface CreateTicketResponse {
-  public_number: string;
-  status: TicketStatus;
-  priority: TicketPriority;
-  source: TicketSource;
-  subject: string;
-  category: string;
-  messages: TicketMessage[];
-  references: ExternalReference[];
-}
-
-export interface GetTicketResponse {
-  public_number: string;
-  status: TicketStatus;
-  priority: TicketPriority;
-  source: TicketSource;
-  subject: string;
-  category: string;
-  messages: TicketMessage[];
-  references: ExternalReference[];
 }
 
 export interface AddMessageRequest {
@@ -98,6 +83,8 @@ export interface AddMessageRequest {
 export interface AddMessageResponse {
   id: number;
   is_internal: boolean;
+  author_type: TicketAuthorType;
+  duplicate: boolean;
 }
 
 export interface UploadAttachmentRequest {
@@ -106,6 +93,7 @@ export interface UploadAttachmentRequest {
   file: Buffer;
   filename: string;
   mimeType: string;
+  source?: TicketSource;
 }
 
 export interface UploadAttachmentResponse {
@@ -115,6 +103,7 @@ export interface UploadAttachmentResponse {
 export interface ChangeStatusRequest {
   status: TicketStatus;
   user_id?: number;
+  source?: TicketSource;
 }
 
 export interface AddReferenceRequest {
@@ -122,6 +111,7 @@ export interface AddReferenceRequest {
   external_type: string;
   external_id: string;
   metadata?: Record<string, unknown>;
+  move?: boolean;
 }
 
 export interface AddReferenceResponse {
@@ -131,17 +121,24 @@ export interface AddReferenceResponse {
   external_id: string;
 }
 
-// ====================================
-// Data Models
-// ====================================
+export interface TicketAttachment {
+  id: number;
+  message_id: number | null;
+  original_name: string;
+  mime_type: string;
+  size: number;
+  created_at: string;
+}
 
 export interface TicketMessage {
   id: number;
   body: string;
   is_internal: boolean;
   author_type: TicketAuthorType;
+  author_user_id?: number | null;
   source: TicketSource;
   external_message_id: string | null;
+  created_at?: string;
 }
 
 export interface ExternalReference {
@@ -151,19 +148,33 @@ export interface ExternalReference {
 }
 
 export interface Ticket {
+  id?: number;
   public_number: string;
   status: TicketStatus;
   priority: TicketPriority;
   source: TicketSource;
   subject: string;
   category: string;
+  category_name?: string;
+  is_sensitive?: boolean;
+  team?: string | null;
+  owner_user_id?: number;
+  assignee_user_id?: number | null;
+  server_id?: number | null;
+  merged_into?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  first_response_at?: string | null;
+  resolved_at?: string | null;
+  closed_at?: string | null;
+  last_activity_at?: string;
   messages: TicketMessage[];
+  attachments?: TicketAttachment[];
   references: ExternalReference[];
 }
 
-// ====================================
-// Category Types
-// ====================================
+export type CreateTicketResponse = Ticket;
+export type GetTicketResponse = Ticket;
 
 export interface CategoryFormField {
   key: string;
@@ -180,13 +191,19 @@ export interface CategoryFormSchema {
 export interface Category {
   key: string;
   name: string;
+  description?: string;
+  is_active?: boolean;
   is_sensitive: boolean;
   requires_server: boolean;
   default_priority: TicketPriority;
+  team?: string | null;
   form_schema?: CategoryFormSchema;
 }
 
-// Известные категории из спецификации
+export interface CategoriesResponse {
+  data: Category[];
+}
+
 export const KNOWN_CATEGORIES: Record<string, Partial<Category>> = {
   technical: { is_sensitive: false, requires_server: true },
   server_issue: { is_sensitive: false, requires_server: true },
@@ -199,39 +216,67 @@ export const KNOWN_CATEGORIES: Record<string, Partial<Category>> = {
   other: { is_sensitive: false, requires_server: false },
 } as const;
 
-// ====================================
-// API Error Types
-// ====================================
+export interface StaffPermissions {
+  can_view_tickets: boolean;
+  can_view_all_tickets: boolean;
+  can_reply: boolean;
+  can_internal_notes: boolean;
+  can_view_sensitive: boolean;
+  can_change_status: boolean;
+  can_change_priority: boolean;
+  can_assign: boolean;
+  can_close: boolean;
+  can_create_tickets: boolean;
+  can_reply_own: boolean;
+  is_admin: boolean;
+}
 
-export interface ApiError {
-  message: string;
-  errors?: Record<string, string[]>;
-  statusCode: number;
+export interface UserLookupResponse {
+  user_id: number;
+  name: string;
+  discord_name: string;
+  role: string;
+  role_id: number;
+  role_power: number;
+  is_banned: boolean;
+  permissions: StaffPermissions;
+}
+
+export interface OutboxEvent {
+  id: number;
+  ticket_id: number;
+  ticket_number: string;
+  category: string;
+  is_sensitive: boolean;
+  event_type: string;
+  source: string;
+  actor_user_id: number | null;
+  message_id: number | null;
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface EventsFeedResponse {
+  data: OutboxEvent[];
+  next_after_id: number;
+  has_more: boolean;
 }
 
 export class TicketApiError extends Error {
   constructor(
     message: string,
     public statusCode: number,
-    public errors?: Record<string, string[]>
+    public code?: string,
+    public errors?: Record<string, string[]>,
+    public ticketNumber?: string,
+    public extra?: Record<string, unknown>
   ) {
     super(message);
     this.name = 'TicketApiError';
   }
 }
 
-// ====================================
-// State Machine
-// ====================================
-
-/**
- * Разрешенные переходы между статусами
- * Основано на таблице переходов из спецификации
- */
-export const ALLOWED_STATUS_TRANSITIONS: Record<
-  TicketStatus,
-  TicketStatus[]
-> = {
+export const ALLOWED_STATUS_TRANSITIONS: Record<TicketStatus, TicketStatus[]> = {
   [TicketStatus.Open]: [
     TicketStatus.InProgress,
     TicketStatus.WaitingForStaff,
@@ -274,46 +319,4 @@ export function isStatusTransitionAllowed(
   return ALLOWED_STATUS_TRANSITIONS[from].includes(to);
 }
 
-// ====================================
-// User & Permissions (для будущего расширения)
-// ====================================
-
-/**
- * ВАЖНО: Реализация отложена до появления endpoint'а на сайте
- * См. gaps #6 в спецификации
- */
-export interface UserLookupResponse {
-  user_id: number;
-  name: string;
-  role: string;
-  permissions: {
-    can_view_tickets: boolean;
-    can_view_all_tickets: boolean;
-    can_reply: boolean;
-    can_internal_notes: boolean;
-    can_view_sensitive: boolean;
-    is_admin: boolean;
-  };
-}
-
-/**
- * Минимальная роль для работы с тикетами (Хелпер, power=5)
- */
 export const MIN_STAFF_ROLE_POWER = 5;
-
-// ====================================
-// Webhook Event (для будущего расширения)
-// ====================================
-
-/**
- * ВАЖНО: Реализация отложена до появления outbox/feed endpoint'а
- * См. gaps #4 в спецификации
- */
-export interface OutboxEvent {
-  id: number;
-  ticket_number: string;
-  event_type: TicketEventType;
-  message_id?: number;
-  source: TicketSource;
-  created_at: string;
-}

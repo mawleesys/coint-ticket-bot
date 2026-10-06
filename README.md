@@ -131,18 +131,17 @@ graph TB
 
 ### Этап 1: Зеркалирование (read-only)
 
-- ⏳ Сайт реализует outbox/event feed (gap #4)
-- ⏳ Синхронизация сайт → Discord (новые тикеты, сообщения, изменения)
-- ⏳ Отключение старого webhook
-- ⏳ Обработка вложений (скачивание с сайта)
+- ✅ Сайт: outbox `GET /events` (skip `source=discord`)
+- ✅ Бот поллит ленту и держит курсор на диске
+- ⏳ Включить API в prod и выключить старый webhook
+- ⏳ Пересылка вложений с сайта
 
 ### Этап 2: Двусторонняя синхронизация
 
-- ⏳ Сайт реализует Discord user lookup (gap #6)
-- ⏳ Discord → сайт: сообщения и внутренние заметки
-- ⏳ Обработка кнопок (взять, решить, закрыть, приоритет)
+- ✅ `GET /users/by-discord/{id}` — без заглушки `user_id=1`
+- ✅ Discord → сайт: ответы и `!note`, replay 200 / 409
+- ⏳ Кнопки «взять» и приоритет (на сайте нет assign/priority API)
 - ⏳ Загрузка вложений Discord → сайт
-- ⏳ Проверка прав доступа через API (gap #2)
 
 ### Этап 3: Статистика и отчёты
 
@@ -177,8 +176,11 @@ coint-ticket-bot/
 │   │   └── demo.ts                # Офлайн-демонстрация без токенов
 │   ├── sync/
 │   │   ├── dedupe-guard.ts        # Защита от дублей
+│   │   ├── event-cursor.ts        # Персистентный after_id
+│   │   ├── event-feed.ts          # Правила outbox → Discord
 │   │   ├── loop-guard.ts          # Игнор bot/webhook и source=discord
 │   │   ├── mapping-store.ts       # Хранилище тикет ↔ тред
+│   │   ├── staff-resolver.ts      # Discord → site user + права
 │   │   └── sync-engine.ts         # Движок синхронизации
 │   ├── stats/
 │   │   └── collector.ts           # Сбор статистики
@@ -324,57 +326,15 @@ curl -H "Authorization: Bearer your_secure_random_token_here" \
 
 Ожидаемо: 200 (если тикет существует) или 404 (если нет). Не 401 или 404 для всех маршрутов.
 
-#### 3. Необходимые изменения на сайте
+#### 3. Что уже есть на сайте и что осталось
 
-⚠️ **Следующие функции ещё НЕ реализованы на сайте** (см. `docs/site-internal-api.md`, раздел "Known gaps"):
+Код сайта (2026-10-06) закрыл outbox, lookup Discord, проверки прав, dedupe и расширенный payload. Актуальный список: [`docs/site-gaps.md`](docs/site-gaps.md).
 
-**Критичные для двусторонней синхронизации:**
+Осталось перед продом бота:
 
-1. **Outbox/Event feed** (gap #4)
-   - Нужен endpoint `GET /api/internal/tickets/events?after_id=N`
-   - Или таблица `support_ticket_outbox` с полями:
-     - `id` (auto-increment)
-     - `ticket_id`, `ticket_number`
-     - `event_type` (created, message_added, status_changed, и т.д.)
-     - `message_id` (если применимо)
-     - `source` (website/discord/system)
-     - `created_at`
-   - Бот будет polling этот endpoint вместо парсинга webhook
-
-2. **Discord user lookup** (gap #6)
-   - Endpoint: `GET /api/internal/users/by-discord/{discord_user_id}`
-   - Ответ:
-     ```json
-     {
-       "user_id": 123,
-       "name": "Player123",
-       "role": "Хелпер",
-       "permissions": {
-         "can_view_tickets": true,
-         "can_view_all_tickets": true,
-         "can_reply": true,
-         "can_internal_notes": true,
-         "can_view_sensitive": false,
-         "is_admin": false
-       }
-     }
-     ```
-   - Бот не может работать без этого: нужно знать site user_id для `POST /messages`
-
-3. **Permission checks** (gap #2)
-   - API должен проверять `TicketPolicy` для переданного `user_id`
-   - Возвращать 403, если нет прав
-
-4. **Dedupe по external_message_id** (gap #3)
-   - `support_ticket_messages.external_message_id` должен быть **unique** (или unique в комбинации с `source`)
-   - При дубле возвращать 200 с существующим message
-
-**Желательные:**
-
-5. **Категории с метаданными** (gap #7)
-   - `GET /api/internal/tickets/categories` с полями `key`, `name`, `is_sensitive`, `form_schema`
-6. **Полный payload** (gap #7)
-   - Добавить в ответ API: ticket `id`, `owner`, `assignee`, `team`, timestamps, message author
+1. Выставить `SUPPORT_INTERNAL_API` / `SUPPORT_INTERNAL_TOKEN`.
+2. После стабильного зеркала — выключить старый `support.webhook`.
+3. (Позже) assign/priority API, list/search, scoped download вложений, cleanup outbox.
 
 #### 4. Отключение старого webhook
 
@@ -455,8 +415,10 @@ npm run dev
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
-| `SYNC_POLL_INTERVAL` | `30` | Интервал опроса сайта (секунды) |
-| `SYNC_BATCH_SIZE` | `50` | Макс. тикетов за один цикл |
+| `SYNC_POLL_INTERVAL` | `30` | Интервал опроса `GET /events` (секунды) |
+| `SYNC_BATCH_SIZE` | `50` | Legacy batch (не лента) |
+| `SYNC_EVENTS_LIMIT` | `100` | Событий за запрос (макс. 500) |
+| `SYNC_CURSOR_PATH` | `./data/event-cursor.json` | Файл курсора `after_id` |
 
 ### Статистика
 
@@ -472,11 +434,11 @@ npm run dev
 |---|---|---|
 | `MAX_ATTACHMENT_SIZE` | `8388608` | Макс. размер вложений (байты, 8 MB) |
 | `DEBUG_API_REQUESTS` | `false` | Детальное логирование запросов к API |
-| `FEATURE_SITE_EVENT_FEED` | `false` | Planned: outbox/events (gap #4) |
-| `FEATURE_DISCORD_USER_LOOKUP` | `false` | Planned: Discord → user (gap #6) |
-| `FEATURE_SITE_PERMISSION_CHECK` | `false` | Planned: TicketPolicy на API (gap #2) |
-| `FEATURE_MESSAGE_DEDUPE_BY_EXTERNAL_ID` | `false` | Planned: unique external_message_id (gap #3) |
-| `FEATURE_CATEGORIES_ENDPOINT` | `false` | Planned: список категорий (gap #7) |
+| `FEATURE_SITE_EVENT_FEED` | `true` | Поллинг `GET /events` |
+| `FEATURE_DISCORD_USER_LOOKUP` | `true` | `GET /users/by-discord/{id}` |
+| `FEATURE_SITE_PERMISSION_CHECK` | `true` | Ожидать 403 `forbidden_*` с сайта |
+| `FEATURE_MESSAGE_DEDUPE_BY_EXTERNAL_ID` | `true` | Идемпотентность по Discord message id |
+| `FEATURE_CATEGORIES_ENDPOINT` | `true` | `GET /categories` |
 
 Подробный список доработок сайта: [`docs/site-gaps.md`](docs/site-gaps.md). Спецификация API: [`docs/site-internal-api.md`](docs/site-internal-api.md).
 
@@ -697,20 +659,16 @@ npm run type-check
 
 ### Этап 1: Зеркалирование (read-only)
 
-- [ ] **Сайт:** реализовать outbox/event feed (gap #4)
-- [ ] Бот читает новые тикеты и создаёт треды
-- [ ] Новые сообщения с сайта → Discord
-- [ ] Обновления статуса/приоритета → обновление тегов
-- [ ] Отключить старый webhook
+- [x] Outbox `GET /events` на сайте и поллинг в боте
+- [ ] Включить Internal API в prod
+- [ ] Отключить старый webhook после стабильного зеркала
 
 ### Этап 2: Двусторонняя синхронизация
 
-- [ ] **Сайт:** реализовать Discord user lookup (gap #6)
-- [ ] **Сайт:** проверка прав через API (gap #2)
-- [ ] Discord → сайт: сообщения и заметки
-- [ ] Кнопки управления тикетами
+- [x] Lookup Discord и проверки прав на сайте
+- [x] Ответы / `!note` из Discord без `user_id=1`
+- [ ] Кнопки assign/priority (нужны endpoint’ы сайта)
 - [ ] Вложения в обе стороны
-- [ ] Dedupe на стороне сайта (gap #3)
 
 ### Этап 3: Статистика
 
@@ -818,23 +776,16 @@ export class PersistentMappingStore {
 
 ## Известные ограничения
 
-### Site API gaps
+### Site API
 
-См. подробности в `docs/site-internal-api.md`, раздел 7.
-
-Критичные:
-- **#4:** Нет event feed → polling вместо webhook/push
-- **#6:** Нет Discord user lookup → нельзя резолвить Discord ID → site user_id
-- **#2:** Нет проверки прав → любой user_id может постить
-- **#3:** Нет dedupe → риск дублей при retry
+Актуально: [`docs/site-gaps.md`](docs/site-gaps.md). Outbox, lookup, права и dedupe уже на сайте. Открыто: API выключен в prod, нет assign/priority/list, вложения не scoped, нет cleanup outbox, старый webhook ещё жив.
 
 ### Текущие ограничения бота
 
-- Маппинг тикет ↔ тред хранится в памяти (при рестарте теряется)
-- Polling сайта вместо real-time событий
-- Нет команд для создания тикетов из Discord
-- Нет автоархивации закрытых тредов
-- Статистика в памяти (не персистентна)
+- Маппинг тикет ↔ тред в памяти (ссылка пишется на сайт через `/references`)
+- Курсор ленты персистентен (`SYNC_CURSOR_PATH`)
+- Нет `/ticket` из Discord и автоархивации
+- Статистика в памяти
 
 ---
 

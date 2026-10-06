@@ -1,8 +1,8 @@
 # COINT site — Internal Ticket API & data model (spec for `coint-ticket-bot`)
 
 > Source of truth: Azuriom site, plugin `plugins/support` (Azuriom "Support" 1.1.9, heavily extended in-house).
-> This document was produced by reading the deployed code (read-only). It describes **what exists today**,
-> plus a list of **known gaps** the bot must work around or that need site-side changes.
+> Produced by reading the deployed code. **Updated 2026-10-06:** event feed, categories, Discord user lookup, permission
+> checks, message dedupe and webhook `source` were added on the site. The API is still **disabled** (env not set).
 > No secrets / hosts / personal data are included. `{SITE_URL}` = the site's public base URL (placeholder).
 
 ---
@@ -11,7 +11,7 @@
 
 | Item | Value |
 |---|---|
-| Base prefix | `{SITE_URL}/api/internal/tickets` |
+| Base prefix | `{SITE_URL}/api/internal/tickets` (+ `{SITE_URL}/api/internal/users/...`) |
 | Middleware | Laravel `api` group (`throttle:api` + route-model binding) + `EnsureInternalTicketApi` |
 | Enable flag | env `SUPPORT_INTERNAL_API` (bool, default `false`) → `config('support.internal_api')` |
 | Token | env `SUPPORT_INTERNAL_TOKEN` (string) → `config('support.internal_token')` |
@@ -57,35 +57,40 @@ and the raw numeric DB id. Unknown → **404**.
 
 ## 2. Endpoints
 
-All paths are relative to `{SITE_URL}/api/internal/tickets`.
+All paths are relative to `{SITE_URL}/api/internal/tickets` unless stated otherwise.
+`user_id` = the **site** account acting (resolve a Discord user via §2.11 first).
+
+Common write-endpoint rules (since 2026-10-06):
+- The acting user must not be deleted/banned → **403** `{"code":"user_deleted"|"user_banned"}`.
+- Permissions are checked with the site `TicketPolicy` → **403** `{"message": "...", "code": "forbidden_*"}`.
+- The request `source` (`website`/`discord`/`system`) is recorded on the change and in the event feed (§2.9).
 
 ### 2.1 `POST /` — create ticket
 Body (JSON):
 
 | Field | Rules | Notes |
 |---|---|---|
-| `user_id` | required, integer, exists in `users.id` | Ticket owner (site account). |
-| `category_key` | required, string | Must match `support_categories.key` (see §4.5). Unknown → 422 `Unknown category.` |
+| `user_id` | required, integer, exists in `users.id` | Ticket owner (site account). Needs `tickets.create`, else 403 `forbidden_create`. |
+| `category_key` | required, string | Must match `support_categories.key` (see §2.10). Unknown → 422 `Unknown category.` |
 | `subject` | required, string, max 100 | |
 | `body` | required, string, max 5000 | First message (trimmed; empty → 422). |
 | `server_id` | nullable, integer | **Required** if the category has `requires_server=true`; must exist in `servers`. |
-| `fields` | nullable, object | Category form answers, validated per `form_schema` as `fields.<key>` (see §4.5). |
-| `source` | optional, one of `website`/`discord`/`system` (default `website`) | Invalid → 422 `Unsupported ticket source.` `system` bypasses spam guards. |
+| `fields` | nullable, object | Category form answers, validated per `form_schema` as `fields.<key>`. |
+| `source` | optional, `website`/`discord`/`system` (default `website`) | Invalid → 422 `Unsupported ticket source.` `system` bypasses anti-spam — never use it for player-initiated tickets. |
 
 Behaviour:
 - Inactive category → 422 (`category_id`).
 - Anti-spam (unless `source=system`): max active tickets (`support.max_open`) and cooldown → 422 (`subject`).
-- `shop_payment`: `fields.payment_id` must be a payment (id or transaction id) **owned by that user**, else 422 (`fields.payment_id`).
-- Priority = category `default_priority`; `urgent` is downgraded to `normal` when created by the owner (the API always passes the owner as actor).
-- Status = `open`; team = category's `assigned_team_id`; `public_number` auto-generated (`COINT-<n>`, incrementing from the latest).
-- `metadata` is filled with context: `account_user_id`, `minecraft.game_id`, `server_id`, `source`, `form` answers, `payment_id`, and `discord.{discord_user_id,name}` if the owner has linked Discord.
-- Side effects after commit: staff site notifications + **Discord webhook `created`** (§6).
+- `shop_payment`: `fields.payment_id` must be a payment owned by that user, else 422 (`fields.payment_id`).
+- Priority = category `default_priority` (`urgent` downgraded to `normal` for owner-created tickets).
+- Status `open`; team = category team; `public_number` auto-generated (`COINT-<n>`).
+- `metadata` gets context incl. `discord.{discord_user_id,name}` if the owner has linked Discord.
+- Side effects: staff site notifications, Discord webhook `created`, feed event `created` (with `message_id` of the first message).
 
-Response **201** — ticket payload (§2.8) with public messages only.
+Response **201** — ticket payload (§2.8), public messages only.
 
 ### 2.2 `GET /{ticket}` — show ticket
-Query: `include_internal` (bool, default false) — include internal staff notes.
-
+Query: `include_internal` (bool, default false) — include internal notes and their attachments.
 Response **200** — ticket payload (§2.8).
 
 ### 2.3 `POST /{ticket}/messages` — add message (reply or internal note)
@@ -96,107 +101,183 @@ Body (JSON):
 | `user_id` | required, integer, exists | Author (site account). |
 | `body` | required, string, max 5000 | Trimmed. |
 | `is_internal` | nullable, boolean (default false) | Internal staff note. |
-| `external_message_id` | nullable, string, max 191 | e.g. Discord message snowflake. Stored on the message. |
-| `source` | optional `website`/`discord`/`system` (**default `discord`**) | |
+| `external_message_id` | nullable, string, max 191 | Discord message snowflake. **Idempotency key** together with `source`. |
+| `source` | optional (**default `discord`**) | |
 
-Behaviour (`TicketMessageService::reply`):
-- Ticket `closed` or merged → 422 (`body`).
-- `author_type` is derived: **author == ticket owner → `user`, anyone else → `staff`**. (No permission check — see gaps.)
-- Owner cannot post internal notes → 422 (`visibility`).
-- Public messages are throttled per author (10/min) → 422 (`body`).
-- Status auto-transitions:
-  - owner reply: `waiting_for_user` / `resolved` / `in_progress` → `waiting_for_staff` (`open`, `waiting_for_staff` unchanged);
-  - staff reply: `open` / `in_progress` / `waiting_for_staff` / `resolved` → `waiting_for_user`;
-  - staff reply sets `first_response_at` (if null) and `last_staff_message_at`; owner reply sets `last_user_message_at`.
-  - These auto-transitions do **not** fire a `status` webhook (announce=false), but are recorded as events.
-- Internal note → event `internal_note_added`, webhook `internal_note` (without body). No status change.
-- Side effects after commit: webhook `user_replied` / `staff_replied` (with excerpt) and site/email notifications.
-- `external_message_id` is written **after** the message is created (separate save).
+Order of checks:
+1. If `external_message_id` is given and a message with the same `(source, external_message_id)` exists:
+   - same ticket → **200** with that message and `"duplicate": true` (no new row, **no webhook, no notifications, no feed event**);
+   - another ticket → **409** `{"code":"external_message_conflict","ticket_number":"COINT-…","id":…}`.
+2. Author deleted/banned → 403.
+3. Permission (`TicketPolicy`):
+   - author is the ticket owner → needs `tickets.reply_own`;
+   - otherwise public reply → staff must see the ticket (sensitive → `view_sensitive`; `view_all`, or `view` + unassigned/assigned to self) **and** have `tickets.staff.reply` → else 403 `forbidden_reply`;
+   - `is_internal=true` → see the ticket + `tickets.staff.internal_notes` → else 403 `forbidden_internal_note`.
+   Staff is therefore determined by permission; the service also refuses non-owners without the staff permission.
+4. Ticket `closed`/merged → 422 (`body`); owner internal note → 422 (`visibility`); public replies throttled 10/min per author → 422 (`body`).
+5. Insert happens with `external_message_id` in the same transaction; a concurrent duplicate hits the unique index and is answered like step 1.
 
-Response **201**:
+Status auto-transitions (no `status` webhook, but recorded as feed events):
+owner reply: `waiting_for_user`/`resolved`/`in_progress` → `waiting_for_staff`; staff reply: `open`/`in_progress`/`waiting_for_staff`/`resolved` → `waiting_for_user` (+ `first_response_at`).
+
+Response **201** (new) / **200** (duplicate):
 ```json
-{ "id": 1234, "is_internal": false }
+{ "id": 1234, "is_internal": false, "author_type": "staff", "duplicate": false }
 ```
 
 ### 2.4 `POST /{ticket}/attachments` — upload attachment
-`multipart/form-data`:
-
-| Field | Rules |
-|---|---|
-| `user_id` | required, integer, exists (uploader) |
-| `message_id` | nullable, integer — must be a message **of this ticket** (else 404) |
-| `file` | required, file, max 8192 KB |
-
-Allowed types (extension **and** detected MIME must match):
-`png` (image/png), `jpg`/`jpeg` (image/jpeg), `webp` (image/webp), `txt` (text/plain),
-`log` (text/plain, text/x-log, application/octet-stream; rejected if it contains NUL bytes),
-`zip` (application/zip variants), `mp4` (video/mp4). Otherwise 422 (`attachments`).
-Stored on the local disk as `tickets/<ticket_id>/<uuid>.<ext>`; original name sanitized; sha256 stored.
-Records event `attachment_added`. **No webhook** is sent for attachments.
-
+`multipart/form-data`: `user_id` (required), `message_id` (nullable, must belong to this ticket → else 404), `file` (required, ≤ 8192 KB), `source` (optional, default `discord`).
+Permission: attaching to an internal message → `internal_notes` rule; otherwise the reply rule (§2.3) → 403 `forbidden_attachment`.
+Allowed types (extension **and** detected MIME): png, jpg/jpeg, webp, txt, log (no NUL bytes), zip, mp4 → else 422 (`attachments`).
+Feed event `attachment_added` (`payload.attachment_id`, `payload.name`). No webhook.
 Response **201**: `{ "id": 55 }`
 
 ### 2.5 `GET /attachments/{attachment}` — download attachment
-`{attachment}` = numeric attachment id. Streams the file (`Content-Disposition: attachment; filename=<original_name>`).
-404 if missing. Not scoped to a ticket and no internal/sensitive filtering (bot must enforce visibility).
+Numeric id; streams the file. 404 if missing. Still **not** ticket-scoped and not filtered by internal/sensitive — the bot must enforce visibility (use `attachments[]` from §2.8, which already hides internal ones unless `include_internal=1`).
 
 ### 2.6 `POST /{ticket}/status` — change status
-Body: `status` (required, one of the TicketStatus values §3.1), `user_id` (nullable, integer, exists → actor; null = "system").
-
-- Same status → no-op.
-- Transition not allowed by the state machine (§3.1) → 422 (`status`).
-- Sets `resolved_at` / `closed_at` accordingly; reopening clears them.
-- Records `status_changed` (+ `resolved` / `closed` / `reopened`) events; sends webhook `status` / `resolved` / `closed` / `reopened`.
-- Note: unlike the website flow, this endpoint does **not** send the player notification for resolved/closed.
-
+Body: `status` (required, §3.1), `user_id` (integer, exists — **required unless `source=system`**, else 422 `user_id`), `source` (optional, default `discord`).
+Permission: owner may only set `closed` (`reply_own`); staff: `closed` → `tickets.staff.close`, other statuses → `tickets.staff.change_status` (plus ticket visibility) → else 403 `forbidden_status`.
+Invalid transition → 422 (`status`). Same status → no-op.
+`resolved` / `closed` by a user now also send the player notification (same as the website).
 Response **200** — ticket payload (§2.8).
 
 ### 2.7 `POST /{ticket}/references` — link an external object
-Body:
+Body: `provider` (required, ≤50, not `launcher`), `external_type` (required, ≤50), `external_id` (required, ≤191), `metadata` (object, optional), `move` (bool, optional).
+Unique key `(provider, external_type, external_id)`:
+- new → **201**; already on this ticket → **200** (metadata replaced);
+- already on another ticket → **409** `{"code":"reference_conflict","ticket_number":"COINT-…"}` unless `move: true` (then re-pointed, 201).
 
-| Field | Rules |
-|---|---|
-| `provider` | required, string, max 50, **not** `launcher` (e.g. `discord`) |
-| `external_type` | required, string, max 50 (e.g. `thread`, `starter_message`, `channel`) |
-| `external_id` | required, string, max 191 (snowflake) |
-| `metadata` | nullable, object |
+Response: `{ "id": 7, "provider": "discord", "external_type": "thread", "external_id": "123456789012345678" }`
 
-Upsert on the unique key `(provider, external_type, external_id)`. If that triple already exists **on another ticket,
-it is silently moved** to this ticket and its metadata replaced.
-
-Response **201**:
-```json
-{ "id": 7, "provider": "discord", "external_type": "thread", "external_id": "123456789012345678" }
-```
-
-### 2.8 Ticket payload (returned by create / show / status)
-Exact shape built by `InternalTicketController::payload()`:
+### 2.8 Ticket payload (create / show / status)
 ```json
 {
+  "id": 207,
   "public_number": "COINT-1207",
   "status": "waiting_for_staff",
   "priority": "normal",
   "source": "website",
   "subject": "Не заходит на сервер",
   "category": "technical",
+  "category_name": "Техническая проблема",
+  "is_sensitive": false,
+  "team": "technical",
+  "owner_user_id": 123,
+  "assignee_user_id": null,
+  "server_id": 2,
+  "merged_into": null,
+  "created_at": "2026-10-06T10:00:00+05:00",
+  "updated_at": "2026-10-06T10:05:00+05:00",
+  "first_response_at": null,
+  "resolved_at": null,
+  "closed_at": null,
+  "last_activity_at": "2026-10-06T10:05:00+05:00",
   "messages": [
     {
       "id": 901,
       "body": "Текст сообщения",
       "is_internal": false,
       "author_type": "user",
+      "author_user_id": 123,
       "source": "website",
-      "external_message_id": null
+      "external_message_id": null,
+      "created_at": "2026-10-06T10:00:00+05:00"
     }
+  ],
+  "attachments": [
+    { "id": 55, "message_id": 901, "original_name": "latest.log", "mime_type": "text/plain", "size": 20480, "created_at": "2026-10-06T10:00:00+05:00" }
   ],
   "references": [
     { "provider": "discord", "external_type": "thread", "external_id": "123456789012345678" }
   ]
 }
 ```
-- `messages` are ordered by id; internal notes only with `include_internal=1` (show only).
-- **Not included** (gaps): numeric ticket id, owner/assignee/team, created/updated/activity timestamps, SLA/overdue,
-  `metadata`, message author user id / name / created_at, attachments (loaded but not serialized), category name or `is_sensitive`.
+All original keys are unchanged; the rest were added (additive, backwards compatible). Timestamps are ISO-8601 with the
+server offset. Internal messages/attachments only with `include_internal=1` (show). Bodies of sensitive tickets **are**
+returned — route them by `is_sensitive` to the restricted channel only.
+
+### 2.9 `GET /events?after_id=&limit=` — change feed (outbox)
+Query: `after_id` (int ≥ 0, default 0), `limit` (1–500, default 100). Ordered by `id` ascending; `id` is the cursor.
+```json
+{
+  "data": [
+    {
+      "id": 1842,
+      "ticket_id": 207,
+      "ticket_number": "COINT-1207",
+      "category": "technical",
+      "is_sensitive": false,
+      "event_type": "message_created",
+      "source": "discord",
+      "actor_user_id": 45,
+      "message_id": 901,
+      "payload": { "author_type": "staff", "is_internal": false },
+      "created_at": "2026-10-06T10:00:00+05:00"
+    }
+  ],
+  "next_after_id": 1842,
+  "has_more": false
+}
+```
+- `event_type`: every `TicketEventType` (§3.5) **except** `internal_note_added`, plus `message_created`
+  (any new message after ticket creation, incl. internal notes with `payload.is_internal=true`).
+  Ticket creation emits only `created` (with `message_id` of the first message), not `message_created`.
+- `source`: where the change came from — `website` (site UI), `discord` (internal API, default), `system` (cron/console, or API with `source=system`).
+  For `created` it is the ticket's source. **Skip `source=discord` events you produced yourself** (loop guard); still
+  use them for state if needed (e.g. auto status change after your reply).
+- No message text in the feed. Fetch bodies via §2.2.
+- `is_sensitive=true`: `payload` is reduced to non-textual keys (ids, statuses); e.g. attachment file names are removed.
+- `payload` per type = §3.5; `message_created` → `{author_type, is_internal}`.
+- Rows are written in the same DB transaction as the change (no lost/phantom events). The feed starts empty
+  (deployed 2026-10-06); there is no backfill of older history. No retention/pruning yet.
+- Poll with `after_id = last processed id`; persist the cursor on the bot side.
+
+### 2.10 `GET /categories`
+```json
+{ "data": [
+  { "key": "shop_payment", "name": "Магазин и оплата", "description": "…", "is_active": true, "is_sensitive": false,
+    "requires_server": false, "default_priority": "normal", "team": "payments",
+    "form_schema": { "fields": [ { "key": "payment_id", "type": "text", "required": true, "label": "Номер платежа" } ] } }
+] }
+```
+Ordered by `sort_order`. `options` appears on a field only for `select`.
+
+### 2.11 `GET {SITE_URL}/api/internal/users/by-discord/{discord_user_id}`
+Same auth/enable flags. `discord_user_id` must be 5–25 digits → else 422 `invalid_discord_id`.
+- not linked → **404** `{"code":"discord_not_linked"}` (tell the user to link Discord in the site profile);
+- linked to several site accounts (no unique index in `discord_accounts`) → **409** `{"code":"discord_link_conflict","user_ids":[…]}`;
+- linked account deleted → **404** `{"code":"user_deleted"}`;
+- several rows for the same user → the most recently updated one is used.
+
+Response **200**:
+```json
+{
+  "user_id": 123,
+  "name": "Player123",
+  "discord_name": "player123",
+  "role": "Хелпер",
+  "role_id": 13,
+  "role_power": 5,
+  "is_banned": false,
+  "permissions": {
+    "can_view_tickets": true,
+    "can_view_all_tickets": true,
+    "can_reply": true,
+    "can_internal_notes": true,
+    "can_view_sensitive": false,
+    "can_change_status": true,
+    "can_change_priority": true,
+    "can_assign": true,
+    "can_close": true,
+    "can_create_tickets": true,
+    "can_reply_own": true,
+    "is_admin": false
+  }
+}
+```
+Flags are computed with the same `TicketAccess` rules as the site (admin roles → all true). They are global flags;
+per-ticket visibility (sensitive / assigned to someone else) is still enforced by the write endpoints.
 
 ---
 
@@ -231,7 +312,7 @@ Russian UI labels come from `support::messages.state.<value>`.
 ### 3.5 `TicketEventType` (`support_ticket_events.event_type`) and payloads
 | type | payload |
 |---|---|
-| `created` | `{source, category}` |
+| `created` | `{source, category, message_id}` (message_id since 2026-10-06) |
 | `assigned` / `unassigned` | `{from_user_id, to_user_id}` |
 | `team_changed` | `{from_team_id, to_team_id}` |
 | `status_changed` | `{from, to}` |
@@ -242,7 +323,7 @@ Russian UI labels come from `support::messages.state.<value>`.
 | `attachment_added` | `{attachment_id, name}` |
 | `merged` | `{source, target}` (public numbers; recorded on both tickets) |
 
-Events are **not exposed** by the API (no feed endpoint).
+These events (except `internal_note_added`) plus `message_created` are exposed via the feed (§2.9).
 
 ---
 
@@ -260,7 +341,8 @@ All ids are `increments` (unsigned int). Timestamps = `created_at`/`updated_at` 
 
 ### 4.2 `support_ticket_messages`
 `id`, `ticket_id` (FK, cascade), `author_type` (string), `author_user_id` (FK users, nullable),
-`source` (default `website`), `body` (text), `is_internal` (bool), `external_message_id` (string, nullable, **index, NOT unique**), timestamps.
+`source` (default `website`), `body` (text), `is_internal` (bool), `external_message_id` (string, nullable, indexed), timestamps.
+**Unique** `(source, external_message_id)` (`support_ticket_messages_source_ext_unique`, NULLs allowed multiple times).
 (Legacy `support_comments` table still exists; its rows were migrated into this table.)
 
 ### 4.3 `support_ticket_attachments`
@@ -299,19 +381,23 @@ Current catalog (keys are stable identifiers):
 `id`, `ticket_id` (FK, cascade), `provider`, `external_type`, `external_id`, `metadata` (json), timestamps.
 **Unique** `(provider, external_type, external_id)` (`support_ticket_ext_ref_unique`). Currently empty.
 
+### 4.7b `support_ticket_outbox` (event feed, since 2026-10-06)
+`id` (bigint, cursor), `ticket_id` (FK, cascade), `event_type` (≤64), `source` (≤32), `actor_user_id` (FK users, nullable),
+`message_id` (nullable, no FK), `payload` (json, no message text), `created_at`. Index `(ticket_id, id)`.
+
 ### 4.8 Discord account link (Azuriom core): `discord_accounts`
 `id`, `name` (Discord username), `user_id` (FK users, cascade), `discord_user_id` (string snowflake, **no unique index**),
 `access_token`, `refresh_token`, `expires_at`, timestamps. One row per user (`User::discordAccount()` hasOne).
 Created via the profile "Link Discord" OAuth flow (Socialite `discord`); used for Discord Linked Roles
 (`settings.discord.link_roles = 1`). The OAuth tokens are secrets and must never be exposed to the bot.
-(`social_links` is an unrelated table for profile social links.)
+(`social_links` is an unrelated table for profile social links.) Some Discord ids are currently linked to 2 site accounts → lookup returns 409 for them.
 Roles: `users.role_id` → `roles(id, name, power, is_admin)`; permissions: `permissions(role_id, permission)`.
 
 ---
 
 ## 5. Permissions & privacy rules
 
-Permission keys (checked by `TicketPolicy` / `TicketAccess` on the **website** only — not on the internal API):
+Permission keys (checked by `TicketPolicy` / `TicketAccess` on the website **and, since 2026-10-06, on the internal API write endpoints**):
 
 | Permission | Meaning |
 |---|---|
@@ -340,8 +426,8 @@ Player / donor / Media roles: own-ticket permissions only.
 Sensitivity:
 - Category `is_sensitive = true` (currently only `staff_complaint`): subject & body must be hidden outside the senior channel.
   The existing webhook replaces subject and excerpt with "Текст скрыт: чувствительная категория".
-- **The internal API returns full subject/bodies for sensitive tickets** and does not expose `is_sensitive` — the bot
-  must decide by `category` key (or a new endpoint) and route such tickets to a restricted channel only.
+- The internal API returns full subject/bodies for sensitive tickets but now exposes `is_sensitive` (ticket payload, feed,
+  categories). Route such tickets to a restricted channel only; the feed never carries their text.
 
 ---
 
@@ -372,6 +458,8 @@ Sensitivity:
 }
 ```
 (Extra fields depend on the event; colors are hex strings converted by the core Embed class.)
+Since 2026-10-06 every embed has a footer `source: <website|discord|system> · COINT-1207` — the bot can ignore
+webhook posts with `source: discord` if the webhook is still enabled during migration.
 
 Events and titles (`support::messages.webhook.events.*`):
 
@@ -389,38 +477,28 @@ Events and titles (`support::messages.webhook.events.*`):
 | `merged` | :source объединён с :target | Кто изменил, Изменение | |
 
 Not sent: attachments, auto status transitions, merge-close of the source ticket (only `merged`).
-The embed does **not** carry `source`, so messages that came *from* Discord via the API are echoed back by the webhook.
+Messages that came *from* Discord via the API are still posted by the webhook (footer `source: discord`).
 This webhook is meant to be **switched off** once the bot posts into ticket threads (otherwise duplicate feeds).
 
 ---
 
-## 7. Known gaps / required site-side work
+## 7. Known gaps / status (2026-10-06)
 
-Critical for a safe two-way sync:
-1. **API disabled**: `SUPPORT_INTERNAL_API` / `SUPPORT_INTERNAL_TOKEN` not set.
-2. **No author permission check** on `messages`, `status`, `attachments`: any `user_id` is accepted; any non-owner becomes
-   `author_type=staff`. The bot must enforce "Хелпер+ / `tickets.staff.reply`" itself — better: site checks `TicketPolicy`
-   for the given `user_id` (reply / internal_note / changeStatus) and returns 403.
-3. **No dedup by `external_message_id`**: index is not unique, value is saved after creation, and webhooks/notifications fire
-   even on retries. Needs: unique `(source, external_message_id)` (or lookup-before-insert) and passing it into
-   `reply()` inside the transaction; return the existing message (200) on replay.
-4. **No outbox / change feed**: no "list tickets/messages/events since cursor" endpoint and no webhook carrying ticket data.
-   The bot cannot learn about website-side changes except by parsing the human-readable webhook embed. Needs an outbox table
-   (or `GET /events?after_id=`) with event id, ticket number, type, message id, source.
-5. **Loop risk**: API-created messages trigger `staff_replied`/`user_replied` webhooks; payload lacks `source`/`external_message_id`.
-   The outbox must include `source` so the bot skips its own (`source=discord`) messages; the bot must ignore webhook/bot authors.
-6. **No Discord↔account lookup**: no endpoint to resolve `discord_user_id → user_id (+ role, permissions)`; `discord_accounts.discord_user_id`
-   is not unique. Needs e.g. `GET /api/internal/users/by-discord/{id}` returning `user_id`, name, role, staff permission flags.
-7. **Payload too thin** (§2.8): missing ticket id, owner, assignee, team, timestamps, message author/created_at, attachments, category name/sensitivity.
+Done on the site (code + migrations deployed, covered by tests):
+- ✅ #2 permission checks on write endpoints (403 + `code`), staff by permission, banned/deleted users rejected.
+- ✅ #3 dedupe: unique `(source, external_message_id)`, written in the insert transaction, idempotent 200 replay without webhook/notifications, 409 on cross-ticket reuse.
+- ✅ #4/#5 event feed `GET /events` with `source`, `is_sensitive`, no text; webhook embeds carry `source` in the footer.
+- ✅ #6 `GET /api/internal/users/by-discord/{id}` (404 / 409 / 200 with permission flags).
+- ✅ #7 categories endpoint and enriched ticket payload (ids, owner, assignee, team, timestamps, message author/time, attachments, `is_sensitive`).
+- ✅ #10 reference conflicts → 409 unless `move: true`.
+- ✅ #11 resolve/close via API send player notifications.
 
-Important:
-8. No endpoints for assign/claim, priority, category, team, merge, list/search tickets, categories list, or find-by-reference.
-9. `GET /attachments/{id}` is not ticket-scoped and ignores internal/sensitive visibility.
-10. `storeReference` silently re-points an existing triple to another ticket (no conflict error).
-11. Status changes via API skip the player notifications that the website sends on resolve/close.
-12. Single shared rate bucket (60 req/min per IP) for the whole bot; per-author reply limit 10/min still applies.
-13. `source=system` on create bypasses anti-spam; the bot should never send it for player-initiated tickets.
-14. Message edits/deletes are not supported (no endpoint); Discord edits will not propagate.
-15. Webhook sends are synchronous, best-effort (5s timeout, no retry).
-16. Metrics: `first_response_at` is populated only for tickets after the 2026-09-23 migration; historic first-response
-    must be derived from the first non-internal `staff` message.
+Still open:
+1. **API disabled**: `SUPPORT_INTERNAL_API` / `SUPPORT_INTERNAL_TOKEN` not set (intentional until the bot is ready).
+2. No endpoints for assign/claim, priority, category, team, merge, list/search tickets, find-by-reference.
+3. `GET /attachments/{id}` is not ticket-scoped and ignores internal/sensitive visibility.
+4. Single shared rate bucket (60 req/min per IP); per-author reply limit 10/min.
+5. Message edits/deletes are not supported.
+6. Webhook sends are synchronous best-effort (5s, no retry); disable `support.webhook` once the bot mirrors via the feed.
+7. Feed has no retention/pruning and no backfill of pre-2026-10-06 history.
+8. Metrics: `first_response_at` exists only for tickets after 2026-09-23; derive older values from the first public `staff` message.

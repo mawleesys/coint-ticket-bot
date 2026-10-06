@@ -41,3 +41,6 @@ coverage/
 # Temp
 tmp/
 temp/
+
+# Runtime state (event-feed cursor)
+data/

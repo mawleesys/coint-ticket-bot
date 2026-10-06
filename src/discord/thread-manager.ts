@@ -380,6 +380,21 @@ export class DiscordThreadManager {
     return message.id;
   }
 
+  async postSystemNotice(threadId: string, text: string): Promise<void> {
+    if (this.config.dryRun) {
+      this.logger.info({ threadId, text }, '[DRY RUN] Would notify staff in thread');
+      return;
+    }
+
+    const thread = await this.getThread(threadId);
+    if (!thread) {
+      this.logger.warn({ threadId }, 'Cannot post notice: thread not found');
+      return;
+    }
+
+    await thread.send({ content: text });
+  }
+
   private formatReplyContent(data: TicketReplyData): string {
     let prefix = '';
 

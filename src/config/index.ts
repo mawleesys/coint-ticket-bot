@@ -50,6 +50,8 @@ const configSchema = z
     sync: z.object({
       pollInterval: z.coerce.number().int().min(5).default(30),
       batchSize: z.coerce.number().int().min(1).max(100).default(50),
+      eventsLimit: z.coerce.number().int().min(1).max(500).default(100),
+      cursorPath: z.string().default('./data/event-cursor.json'),
     }),
 
     stats: z.object({
@@ -59,15 +61,15 @@ const configSchema = z
     }),
 
     /**
-     * Feature flags для endpoint'ов, которых ещё нет на сайте.
-     * Включать только после реализации на стороне Azuriom.
+     * Реализованные на сайте endpoint'ы включены по умолчанию.
+     * Выключить можно через FEATURE_*=false, если понадобится откат.
      */
     features: z.object({
-      siteEventFeed: z.boolean().default(false),
-      discordUserLookup: z.boolean().default(false),
-      sitePermissionCheck: z.boolean().default(false),
-      messageDedupeByExternalId: z.boolean().default(false),
-      categoriesEndpoint: z.boolean().default(false),
+      siteEventFeed: z.boolean().default(true),
+      discordUserLookup: z.boolean().default(true),
+      sitePermissionCheck: z.boolean().default(true),
+      messageDedupeByExternalId: z.boolean().default(true),
+      categoriesEndpoint: z.boolean().default(true),
     }),
 
     maxAttachmentSize: z.coerce.number().int().min(1).default(8388608),
@@ -142,6 +144,8 @@ export function readEnvConfig(): Record<string, unknown> {
     sync: {
       pollInterval: parseInt(process.env.SYNC_POLL_INTERVAL || '30', 10),
       batchSize: parseInt(process.env.SYNC_BATCH_SIZE || '50', 10),
+      eventsLimit: parseInt(process.env.SYNC_EVENTS_LIMIT || '100', 10),
+      cursorPath: process.env.SYNC_CURSOR_PATH || './data/event-cursor.json',
     },
 
     stats: {
@@ -151,12 +155,12 @@ export function readEnvConfig(): Record<string, unknown> {
     },
 
     features: {
-      siteEventFeed: process.env.FEATURE_SITE_EVENT_FEED === 'true',
-      discordUserLookup: process.env.FEATURE_DISCORD_USER_LOOKUP === 'true',
-      sitePermissionCheck: process.env.FEATURE_SITE_PERMISSION_CHECK === 'true',
+      siteEventFeed: process.env.FEATURE_SITE_EVENT_FEED !== 'false',
+      discordUserLookup: process.env.FEATURE_DISCORD_USER_LOOKUP !== 'false',
+      sitePermissionCheck: process.env.FEATURE_SITE_PERMISSION_CHECK !== 'false',
       messageDedupeByExternalId:
-        process.env.FEATURE_MESSAGE_DEDUPE_BY_EXTERNAL_ID === 'true',
-      categoriesEndpoint: process.env.FEATURE_CATEGORIES_ENDPOINT === 'true',
+        process.env.FEATURE_MESSAGE_DEDUPE_BY_EXTERNAL_ID !== 'false',
+      categoriesEndpoint: process.env.FEATURE_CATEGORIES_ENDPOINT !== 'false',
     },
 
     maxAttachmentSize: parseInt(process.env.MAX_ATTACHMENT_SIZE || '8388608', 10),
@@ -242,6 +246,8 @@ export function createTestConfig(overrides: Partial<Config> = {}): Config {
     sync: {
       pollInterval: 30,
       batchSize: 50,
+      eventsLimit: 100,
+      cursorPath: './data/event-cursor.json',
     },
     stats: {
       enabled: true,
@@ -249,11 +255,11 @@ export function createTestConfig(overrides: Partial<Config> = {}): Config {
       weeklyReportHour: 9,
     },
     features: {
-      siteEventFeed: false,
-      discordUserLookup: false,
-      sitePermissionCheck: false,
-      messageDedupeByExternalId: false,
-      categoriesEndpoint: false,
+      siteEventFeed: true,
+      discordUserLookup: true,
+      sitePermissionCheck: true,
+      messageDedupeByExternalId: true,
+      categoriesEndpoint: true,
     },
     maxAttachmentSize: 8388608,
     debugApiRequests: false,

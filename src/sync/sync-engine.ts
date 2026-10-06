@@ -1,5 +1,5 @@
 /**
- * Движок синхронизации тикетов между сайтом и Discord
+ * Двусторонняя синхронизация: outbox сайта → Discord и сообщения Discord → сайт.
  */
 
 import type { Logger } from 'pino';
@@ -8,20 +8,36 @@ import type { SiteApiClient } from '../api/site-client.js';
 import type { DiscordThreadManager } from '../discord/thread-manager.js';
 import type { TicketMappingStore } from './mapping-store.js';
 import type { DedupeGuard } from './dedupe-guard.js';
+import type { EventCursorStore } from './event-cursor.js';
 import {
+  TicketApiError,
   TicketSource,
-  type Ticket,
+  TicketStatus,
   type AddMessageRequest,
+  type OutboxEvent,
+  type Ticket,
 } from '../types/api.js';
 import type {
   TicketThreadCreateData,
   TicketReplyData,
 } from '../types/discord.js';
 import { parseStaffThreadMessage } from '../discord/event-mapper.js';
+import { isTicketConfidential } from '../routing/confidentiality.js';
 import {
   isEmptyStaffBody,
   shouldSkipSiteEventToAvoidLoop,
 } from './loop-guard.js';
+import {
+  isCreatedEvent,
+  isMessageEvent,
+  isStateEvent,
+  messageIsInternal,
+  shouldSkipMirrorEvent,
+} from './event-feed.js';
+import {
+  messageForForbidden,
+  resolveStaffFromDiscord,
+} from './staff-resolver.js';
 
 export class SyncEngine {
   private syncInterval: NodeJS.Timeout | null = null;
@@ -32,25 +48,25 @@ export class SyncEngine {
     private readonly threadManager: DiscordThreadManager,
     private readonly mappingStore: TicketMappingStore,
     private readonly dedupeGuard: DedupeGuard,
+    private readonly cursorStore: EventCursorStore,
     private readonly logger: Logger
   ) {}
 
-  // ====================================
-  // Lifecycle
-  // ====================================
-
   start(): void {
     if (this.config.dryRun) {
-      this.logger.info('[DRY RUN] Sync engine would start polling');
+      this.logger.info(
+        { afterId: this.cursorStore.get() },
+        '[DRY RUN] Sync engine would poll GET /events'
+      );
       return;
     }
 
     const intervalMs = this.config.sync.pollInterval * 1000;
-
     this.syncInterval = setInterval(() => {
       void this.syncSiteToDiscord();
     }, intervalMs);
 
+    void this.syncSiteToDiscord();
     this.logger.info(
       { intervalSeconds: this.config.sync.pollInterval },
       'Sync engine started'
@@ -65,58 +81,87 @@ export class SyncEngine {
     }
   }
 
-  // ====================================
-  // Site → Discord Sync
-  // ====================================
-
-  /**
-   * Синхронизация сайт → Discord
-   * ВАЖНО: Временная реализация через polling до реализации outbox/webhook
-   * См. gap #4 в спецификации
-   */
-  syncSiteToDiscord(): void {
+  async syncSiteToDiscord(): Promise<void> {
     if (this.config.dryRun) {
-      this.logger.debug('[DRY RUN] Would poll site for changes');
+      this.logger.debug(
+        { afterId: this.cursorStore.get() },
+        '[DRY RUN] Would poll GET /events?after_id='
+      );
       return;
     }
 
-    this.logger.debug('Starting site → Discord sync cycle');
+    if (!this.config.features.siteEventFeed) {
+      this.logger.debug('Event feed disabled by FEATURE_SITE_EVENT_FEED=false');
+      return;
+    }
 
     try {
-      // TODO: Когда сайт реализует /events endpoint:
-      // const events = await this.siteApi.getEventsSince(lastEventId);
-      // for (const event of events) {
-      //   await this.handleSiteEvent(event);
-      // }
+      let hasMore = true;
+      while (hasMore) {
+        const page = await this.siteApi.getEvents(
+          this.cursorStore.get(),
+          this.config.sync.eventsLimit
+        );
 
-      // Пока что это заглушка
-      this.logger.trace('Site → Discord sync: no events API available');
+        for (const event of page.data) {
+          await this.handleSiteEvent(event);
+          this.cursorStore.set(event.id);
+        }
+
+        if (page.next_after_id > this.cursorStore.get()) {
+          this.cursorStore.set(page.next_after_id);
+        }
+
+        hasMore = page.has_more && page.data.length > 0;
+      }
     } catch (error) {
       this.logger.error({ error }, 'Site → Discord sync failed');
     }
   }
 
-  /**
-   * Создает тред для нового тикета с сайта
-   */
-  async mirrorTicketToDiscord(ticket: Ticket): Promise<void> {
-    // Проверяем, не создан ли уже тред
-    if (this.mappingStore.hasTicket(ticket.public_number)) {
+  async handleSiteEvent(event: OutboxEvent): Promise<void> {
+    if (shouldSkipMirrorEvent(event)) {
       this.logger.debug(
-        { ticket: ticket.public_number },
-        'Thread already exists'
+        {
+          eventId: event.id,
+          type: event.event_type,
+          source: event.source,
+        },
+        'Skipping site event (discord source or non-feed type)'
       );
       return;
     }
 
-    // Определяем, конфиденциальный ли это тикет
-    const isConfidential = this.threadManager.isCategoryConfidential(
-      ticket.category
-    );
+    if (isCreatedEvent(event)) {
+      const ticket = await this.siteApi.getTicket(event.ticket_number, true);
+      await this.mirrorTicketToDiscord(ticket);
+      return;
+    }
 
-    // Формируем данные для создания треда
+    if (isMessageEvent(event) && event.message_id) {
+      await this.mirrorMessageToDiscord(
+        event.ticket_number,
+        event.message_id,
+        messageIsInternal(event)
+      );
+      return;
+    }
+
+    if (isStateEvent(event)) {
+      const ticket = await this.siteApi.getTicket(event.ticket_number);
+      await this.updateThreadFromTicket(ticket);
+    }
+  }
+
+  async mirrorTicketToDiscord(ticket: Ticket): Promise<void> {
+    if (this.mappingStore.hasTicket(ticket.public_number)) {
+      this.logger.debug({ ticket: ticket.public_number }, 'Thread already exists');
+      return;
+    }
+
+    const isConfidential = isTicketConfidential(ticket);
     const firstMessage =
-      ticket.messages.find((m) => !m.is_internal)?.body || '';
+      ticket.messages.find((message) => !message.is_internal)?.body || '';
 
     const threadData: TicketThreadCreateData = {
       ticketNumber: ticket.public_number,
@@ -124,16 +169,16 @@ export class SyncEngine {
       category: ticket.category,
       priority: ticket.priority,
       status: ticket.status,
-      authorName: 'Игрок', // TODO: получать через API когда появится endpoint
+      authorName: ticket.owner_user_id
+        ? `Игрок #${ticket.owner_user_id}`
+        : 'Игрок',
       firstMessage,
       isConfidential,
     };
 
-    // Создаем тред
     const { threadId, starterMessageId } =
       await this.threadManager.createTicketThread(threadData);
 
-    // Сохраняем маппинг
     this.mappingStore.set({
       ticketNumber: ticket.public_number,
       threadId,
@@ -146,7 +191,6 @@ export class SyncEngine {
       updatedAt: new Date(),
     });
 
-    // Регистрируем reference на сайте
     await this.siteApi.addReference(ticket.public_number, {
       provider: 'discord',
       external_type: 'thread',
@@ -158,36 +202,30 @@ export class SyncEngine {
     });
 
     this.logger.info(
-      {
-        ticket: ticket.public_number,
-        threadId,
-        confidential: isConfidential,
-      },
+      { ticket: ticket.public_number, threadId, confidential: isConfidential },
       'Mirrored ticket to Discord'
     );
   }
 
-  /**
-   * Отправляет новое сообщение с сайта в Discord тред
-   */
   async mirrorMessageToDiscord(
     ticketNumber: string,
-    messageId: number
+    messageId: number,
+    includeInternal = true
   ): Promise<void> {
     const mapping = this.mappingStore.getByTicket(ticketNumber);
     if (!mapping) {
-      this.logger.warn(
-        { ticket: ticketNumber },
-        'Cannot mirror message: thread not found'
-      );
+      const ticket = await this.siteApi.getTicket(ticketNumber, true);
+      await this.mirrorTicketToDiscord(ticket);
+    }
+
+    const resolved = this.mappingStore.getByTicket(ticketNumber);
+    if (!resolved) {
+      this.logger.warn({ ticket: ticketNumber }, 'Cannot mirror message: no thread');
       return;
     }
 
-    // Получаем тикет с сайта
-    const ticket = await this.siteApi.getTicket(ticketNumber, true);
-
-    // Находим новое сообщение
-    const message = ticket.messages.find((m) => m.id === messageId);
+    const ticket = await this.siteApi.getTicket(ticketNumber, includeInternal);
+    const message = ticket.messages.find((item) => item.id === messageId);
     if (!message) {
       this.logger.warn({ ticket: ticketNumber, messageId }, 'Message not found');
       return;
@@ -206,112 +244,88 @@ export class SyncEngine {
       return;
     }
 
-    // Проверяем dedupe
     if (
       message.external_message_id &&
       this.dedupeGuard.isProcessed(message.external_message_id)
     ) {
-      this.logger.debug(
-        { ticket: ticketNumber, messageId },
-        'Message already processed'
-      );
       return;
     }
 
-    // Отправляем в Discord
     const replyData: TicketReplyData = {
       messageId: message.id,
       body: message.body,
       authorType: message.author_type,
+      authorName: message.author_user_id
+        ? `user#${message.author_user_id}`
+        : undefined,
       isInternal: message.is_internal,
       source: message.source,
     };
 
     const discordMessageId = await this.threadManager.postReplyToThread(
-      mapping.threadId,
+      resolved.threadId,
       replyData
     );
 
-    // Помечаем как обработанное
     if (message.external_message_id) {
       this.dedupeGuard.markProcessed(message.external_message_id);
     }
-
-    // Обновляем lastSyncedMessageId
     this.mappingStore.updateLastSyncedMessage(ticketNumber, messageId);
 
     this.logger.info(
-      {
-        ticket: ticketNumber,
-        siteMessageId: messageId,
-        discordMessageId,
-      },
+      { ticket: ticketNumber, siteMessageId: messageId, discordMessageId },
       'Mirrored message to Discord'
     );
   }
 
-  /**
-   * Обновляет теги треда при изменении статуса/приоритета
-   */
   async updateThreadFromTicket(ticket: Ticket): Promise<void> {
     const mapping = this.mappingStore.getByTicket(ticket.public_number);
-    if (!mapping) return;
+    if (!mapping) {
+      return;
+    }
 
     await this.threadManager.updateThreadTags(mapping.threadId, {
       status: ticket.status,
       priority: ticket.priority,
       category: ticket.category,
     });
-
-    this.logger.debug(
-      { ticket: ticket.public_number },
-      'Updated thread from ticket'
-    );
   }
 
-  // ====================================
-  // Discord → Site Sync
-  // ====================================
-
-  /**
-   * Обрабатывает сообщение из Discord и отправляет на сайт
-   */
   async handleDiscordMessage(
     threadId: string,
     messageId: string,
-    _authorId: string,
+    authorId: string,
     content: string
-  ): Promise<void> {
+  ): Promise<{ notice?: string }> {
     const ticketNumber = this.mappingStore.getTicketByThread(threadId);
     if (!ticketNumber) {
-      this.logger.debug({ threadId }, 'Message in non-ticket thread, ignoring');
-      return;
+      return {};
     }
 
-    // Проверяем dedupe
     if (this.dedupeGuard.isProcessed(messageId)) {
-      this.logger.debug({ messageId }, 'Discord message already processed');
-      return;
+      return {};
     }
-
-    // TODO: Резолвим Discord user → site user через API (gap #6)
-    // const siteUser = await this.siteApi.getUserByDiscordId(authorId);
-    // if (!siteUser) {
-    //   await this.sendUserNotLinkedMessage(threadId);
-    //   return;
-    // }
-
-    // Временная заглушка: используем фиктивный user_id
-    const siteUserId = 1; // TODO: реальный lookup
 
     const parsed = parseStaffThreadMessage(content);
     if (isEmptyStaffBody(parsed.body)) {
-      this.logger.debug({ messageId }, 'Ignoring empty Discord message');
-      return;
+      return {};
+    }
+
+    const action = parsed.isInternal ? 'internal_note' : 'reply';
+    const resolved = await resolveStaffFromDiscord(
+      this.siteApi,
+      authorId,
+      action,
+      this.config.site.url
+    );
+
+    if (!resolved.ok) {
+      await this.threadManager.postSystemNotice(threadId, resolved.reason);
+      return { notice: resolved.reason };
     }
 
     const request: AddMessageRequest = {
-      user_id: siteUserId,
+      user_id: resolved.user.user_id,
       body: parsed.body,
       is_internal: parsed.isInternal,
       external_message_id: messageId,
@@ -320,11 +334,7 @@ export class SyncEngine {
 
     try {
       const response = await this.siteApi.addMessage(ticketNumber, request);
-
-      // Помечаем как обработанное
       this.dedupeGuard.markProcessed(messageId);
-
-      // Обновляем lastSyncedMessageId
       this.mappingStore.updateLastSyncedMessage(ticketNumber, response.id);
 
       this.logger.info(
@@ -332,11 +342,20 @@ export class SyncEngine {
           ticket: ticketNumber,
           discordMessageId: messageId,
           siteMessageId: response.id,
+          duplicate: response.duplicate,
           isInternal: parsed.isInternal,
         },
-        'Synced Discord message to site'
+        response.duplicate
+          ? 'Replay of Discord message ignored by site'
+          : 'Synced Discord message to site'
       );
+      return {};
     } catch (error) {
+      if (error instanceof TicketApiError) {
+        const notice = messageForForbidden(error.code);
+        await this.threadManager.postSystemNotice(threadId, notice);
+        return { notice };
+      }
       this.logger.error(
         { error, ticket: ticketNumber, messageId },
         'Failed to sync Discord message to site'
@@ -345,28 +364,39 @@ export class SyncEngine {
     }
   }
 
-  /**
-   * Обрабатывает изменение статуса через кнопку Discord
-   */
   async handleStatusButton(
     threadId: string,
-    userId: string,
-    newStatus: string
-  ): Promise<void> {
+    discordUserId: string,
+    newStatus: TicketStatus
+  ): Promise<{ notice?: string }> {
     const ticketNumber = this.mappingStore.getTicketByThread(threadId);
-    if (!ticketNumber) return;
+    if (!ticketNumber) {
+      return {};
+    }
 
-    // TODO: Резолвим Discord user → site user
-    const siteUserId = 1;
+    const action = newStatus === TicketStatus.Closed ? 'close' : 'change_status';
+    const resolved = await resolveStaffFromDiscord(
+      this.siteApi,
+      discordUserId,
+      action,
+      this.config.site.url
+    );
+
+    if (!resolved.ok) {
+      await this.threadManager.postSystemNotice(threadId, resolved.reason);
+      return { notice: resolved.reason };
+    }
 
     await this.siteApi.changeStatus(ticketNumber, {
-      status: newStatus as never,
-      user_id: siteUserId,
+      status: newStatus,
+      user_id: resolved.user.user_id,
+      source: TicketSource.Discord,
     });
 
     this.logger.info(
-      { ticket: ticketNumber, newStatus, userId },
+      { ticket: ticketNumber, newStatus, userId: resolved.user.user_id },
       'Changed ticket status from Discord'
     );
+    return {};
   }
 }

@@ -171,14 +171,17 @@ export function runDryRunDemo(config: Config, logger: Logger): void {
 
   logger.info(
     {
-      planned: [
-        'FEATURE_SITE_EVENT_FEED (gap #4 outbox)',
-        'FEATURE_DISCORD_USER_LOOKUP (gap #6)',
-        'FEATURE_SITE_PERMISSION_CHECK (gap #2)',
-        'FEATURE_MESSAGE_DEDUPE_BY_EXTERNAL_ID (gap #3)',
-        'FEATURE_CATEGORIES_ENDPOINT (gap #7)',
-      ],
+      afterId: 0,
+      endpoint: 'GET /api/internal/tickets/events?after_id=&limit=',
     },
-    '[DRY RUN] Planned site endpoints remain behind feature flags'
+    '[DRY RUN] Would poll the site event feed and persist the cursor'
+  );
+
+  logger.info(
+    {
+      lookup: 'GET /api/internal/users/by-discord/{id}',
+      unlinked: 'Привяжите Discord в профиле на сайте',
+    },
+    '[DRY RUN] Would resolve staff via Discord link and reject unlinked users'
   );
 }

@@ -1,120 +1,36 @@
-# Что сайт должен добавить для полноценной двусторонней синхронизации
+# Статус пробелов Internal Ticket API (2026-10-06)
 
-Источник: `docs/site-internal-api.md`, раздел 7. Бот уже умеет работать со всеми **существующими** 7 endpoint'ами. Ниже — пробелы, без которых безопасный sync невозможен. В коде они спрятаны за feature flags и помечены `TODO/planned`.
+Источник: `docs/site-internal-api.md`, раздел 7. Бот выровнен под эту ревизию.
 
-Флаги (все по умолчанию `false`):
+## Закрыто на сайте (бот уже использует)
 
-| Флаг | Gap | Endpoint / изменение |
+| Бывший gap | Что появилось | Как бот это использует |
 |---|---|---|
-| `FEATURE_SITE_EVENT_FEED` | #4 | `GET /api/internal/tickets/events?after_id=` |
-| `FEATURE_DISCORD_USER_LOOKUP` | #6 | `GET /api/internal/users/by-discord/{id}` |
-| `FEATURE_SITE_PERMISSION_CHECK` | #2 | проверка `TicketPolicy` на write-endpoint'ах |
-| `FEATURE_MESSAGE_DEDUPE_BY_EXTERNAL_ID` | #3 | unique `(source, external_message_id)` |
-| `FEATURE_CATEGORIES_ENDPOINT` | #7 | `GET /api/internal/tickets/categories` |
+| #2 permission checks | 403 + `forbidden_*` / `user_banned` / `user_deleted` | Пишем реальный `user_id` staff; 403 показываем в треде |
+| #3 dedupe | unique `(source, external_message_id)`, 200 `duplicate:true`, 409 cross-ticket | Шлём Discord message id; replay не создаёт петлю |
+| #4 / #5 event feed | `GET /events?after_id=&limit=` + `source` | Поллинг ленты, курсор в `data/event-cursor.json`, skip `source=discord` |
+| #6 Discord lookup | `GET /api/internal/users/by-discord/{id}` | Резолв staff; 404/409 — понятное сообщение, **без** заглушки `user_id=1` |
+| #7 payload / categories | ids, owner, dates, attachments, `is_sensitive`; `GET /categories` | Маршрутизация по `is_sensitive`, автор в карточке |
+| #10 references | 200 на тот же тикет, 409 чужой, `move:true` | Линкуем тред без тихого переноса |
+| #11 notify on resolve/close | сайт шлёт игроку | Бот только меняет статус |
 
-Включайте флаг **только после** выката соответствующей доработки на сайте. Иначе клиент бросит явную ошибку `TODO/planned endpoint`.
+Флаги `FEATURE_*` по умолчанию **включены**. Выключать имеет смысл только для отката.
 
----
+## Ещё открыто
 
-## Критично для этапа 1 (зеркало сайт → Discord)
+1. **API выключен в prod** — нет `SUPPORT_INTERNAL_API` / `SUPPORT_INTERNAL_TOKEN`. Пока 404 на все пути.
+2. **Нет assign / claim / priority / category / team / merge / list / search / find-by-reference.** Кнопки «взять» и смена приоритета некуда слать.
+3. **`GET /attachments/{id}`** не scoped к тикету и не фильтрует internal/sensitive. Бот должен брать id только из `attachments[]` тикета.
+4. **Нет retention/cleanup outbox** и нет бэкапа истории до 2026-10-06. Курсор бота нельзя отматывать в прошлое.
+5. **Старый Discord webhook всё ещё включён.** После этапа 1 его надо выключить (`support.webhook`), иначе дубли в канале. В footer теперь есть `source:` — бот может игнорировать `source: discord`, но треды webhook не создаёт.
+6. Общий rate limit 60 req/min на IP; правки/удаления сообщений API не умеет.
+7. `first_response_at` пуст у тикетов до 2026-09-23 — для статистики брать первое публичное staff-сообщение.
 
-### 1. Включить API
+## Что включить на сайте перед продом бота
 
 ```env
 SUPPORT_INTERNAL_API=true
 SUPPORT_INTERNAL_TOKEN=<openssl rand -base64 32>
 ```
 
-Сейчас API выключен: любой путь отвечает 404.
-
-### 2. Outbox / event feed (gap #4)
-
-Бот не может узнать о тикетах с сайта, кроме как парсить человекочитаемый webhook (его как раз нужно выключить).
-
-Нужен либо:
-
-```
-GET {SITE_URL}/api/internal/tickets/events?after_id=N
-```
-
-либо таблица `support_ticket_outbox`.
-
-Минимальный JSON элемента:
-
-```json
-{
-  "id": 1842,
-  "ticket_number": "COINT-1207",
-  "event_type": "created",
-  "message_id": 901,
-  "source": "website",
-  "created_at": "2026-10-06T10:00:00+05:00"
-}
-```
-
-`source` обязателен: бот пропускает свои же `source=discord` события (защита от петли, gap #5).
-
-После появления feed — отключить `support.webhook`.
-
----
-
-## Критично для этапа 2 (ответы из Discord)
-
-### 3. Discord → user lookup (gap #6)
-
-```
-GET {SITE_URL}/api/internal/users/by-discord/{discord_user_id}
-```
-
-```json
-{
-  "user_id": 123,
-  "name": "Player123",
-  "role": "Хелпер",
-  "permissions": {
-    "can_view_tickets": true,
-    "can_view_all_tickets": true,
-    "can_reply": true,
-    "can_internal_notes": true,
-    "can_view_sensitive": false,
-    "is_admin": false
-  }
-}
-```
-
-Без этого бот не знает, какой `user_id` писать в `POST /messages`. Несвязанный Discord-аккаунт — отказ с подсказкой «привяжите Discord в профиле».
-
-`discord_accounts.discord_user_id` сейчас без unique index: при коллизии лучше 409.
-
-### 4. Проверка прав на API (gap #2)
-
-`POST /messages`, `/status`, `/attachments` принимают любой `user_id`. Любой не-владелец становится `author_type=staff`.
-
-Сайт должен прогонять `TicketPolicy` и отдавать **403**, если нет `tickets.staff.reply` / `internal_notes` / `change_status`. Бот не должен быть единственным слоем авторизации.
-
-### 5. Dedupe по Discord message id (gap #3)
-
-`external_message_id` индексирован, но не уникален и пишется после insert. Retry создаёт дубль и повторный webhook.
-
-Нужно: unique `(source, external_message_id)` (или lookup-before-insert внутри транзакции) и `200` с уже существующим сообщением при повторе.
-
----
-
-## Важно, но не блокирует скелет
-
-6. **Тонкий payload (gap #7):** нет ticket id, owner, assignee, team, timestamps, автора сообщения, вложений, `is_sensitive`. Бот пока хардкодит чувствительность по ключу `staff_complaint`.
-7. Нет assign/claim, priority, list/search, find-by-reference — кнопки «взять / приоритет» на этапе 2 упрутся в это.
-8. `GET /attachments/{id}` не scoped к тикету и не фильтрует internal/sensitive.
-9. `storeReference` молча переносит triple на другой тикет.
-10. Смена статуса через API не шлёт игроку те же уведомления, что сайт.
-11. Общий rate limit 60 req/min на IP бота.
-12. Правки/удаления сообщений API не поддерживает.
-
----
-
-## Как бот обходит пробелы сейчас
-
-- Конфиденциальность: `src/routing/confidentiality.ts` (ключ категории, отдельный форум).
-- Петли: `src/sync/loop-guard.ts` + `DedupeGuard` в памяти.
-- Пользователь Discord: заглушка `user_id=1` и явный TODO (не для продакшена).
-- Синхронизация сайт → Discord: нет poll'а реальных тикетов, пока нет outbox. Dry-run только логирует сценарий.
+После того как бот стабильно зеркалит треды — очистить Discord webhook в настройках Support.

@@ -11,6 +11,7 @@ import { SyncEngine } from '../sync/sync-engine.js';
 import { TicketMappingStore } from '../sync/mapping-store.js';
 import { DedupeGuard } from '../sync/dedupe-guard.js';
 import { StatsCollector } from '../stats/collector.js';
+import { EventCursorStore } from '../sync/event-cursor.js';
 import { shouldIgnoreIncomingDiscordMessage } from '../sync/loop-guard.js';
 
 export class TicketBot {
@@ -21,6 +22,7 @@ export class TicketBot {
   private dedupeGuard: DedupeGuard;
   private syncEngine: SyncEngine;
   private statsCollector: StatsCollector;
+  private cursorStore: EventCursorStore;
   private cleanupInterval: NodeJS.Timeout | null = null;
 
   constructor(
@@ -50,12 +52,17 @@ export class TicketBot {
       config,
       logger.child({ module: 'stats' })
     );
+    this.cursorStore = new EventCursorStore(
+      config.dryRun ? null : config.sync.cursorPath,
+      logger.child({ module: 'eventCursor' })
+    );
     this.syncEngine = new SyncEngine(
       config,
       this.siteApi,
       this.threadManager,
       this.mappingStore,
       this.dedupeGuard,
+      this.cursorStore,
       logger.child({ module: 'syncEngine' })
     );
   }
@@ -204,6 +211,7 @@ export class TicketBot {
     mappings: number;
     dedupeRecords: number;
     statsMetrics: number;
+    eventCursor: number;
   } {
     return {
       ready: this.client.isReady(),
@@ -212,6 +220,7 @@ export class TicketBot {
       mappings: this.mappingStore.getStats().totalMappings,
       dedupeRecords: this.dedupeGuard.getStats().totalRecords,
       statsMetrics: this.statsCollector.getModuleStats().totalMetrics,
+      eventCursor: this.cursorStore.get(),
     };
   }
 }
