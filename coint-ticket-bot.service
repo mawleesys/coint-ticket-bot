@@ -1,0 +1,37 @@
+[Unit]
+Description=COINT Ticket Bot - Discord ticket synchronization
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/coint-ticket-bot
+EnvironmentFile=/opt/coint-ticket-bot/.env
+
+# Запуск
+ExecStart=/usr/bin/node dist/index.js
+
+# Перезапуск при падении
+Restart=always
+RestartSec=10s
+
+# Лимиты ресурсов (опционально)
+MemoryMax=512M
+MemoryHigh=400M
+
+# Логирование
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=coint-ticket-bot
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/coint-ticket-bot/logs
+
+[Install]
+WantedBy=multi-user.target
